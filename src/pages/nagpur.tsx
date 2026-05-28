@@ -1,12 +1,13 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { MapContainer, TileLayer, useMap, useMapEvents } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import * as GeoTIFF from "geotiff";
 import L from "leaflet";
 import {
-  Layers, Thermometer, Map,
+  Thermometer, Map as MapIcon,
   Activity, Satellite, Globe, Database, Info, X, ChevronRight,
 } from "lucide-react";
+// @ts-ignore
+import * as GeoTIFF from "geotiff";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -16,28 +17,552 @@ type LayerType = "lst" | "ndvi" | "rain" | "soil" | "water" | "lulc";
 interface RealStats {
   avg: number; min: number; max: number;
   hotPct: number; modPct: number; coolPct: number; count: number;
+  tiffDerived: boolean;   // true = real TIFF pixels, false = TIFF not loaded
 }
 
 interface AnnualMeans {
   ndvi: number; lst: number; rain: number; soil: number; water: number;
 }
 
-// ─── WEEKLY Band Layout ───────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-const BANDS_PER_WEEK = 6;
-const N_WEEKS        = 52;
+const N_WEEKS = 52;
 
-const BAND_OFFSET: Record<LayerType, number> = {
-  ndvi: 0, lst: 1, rain: 2, soil: 3, water: 4, lulc: 5,
+// ─── Tile Configuration ───────────────────────────────────────────────────────
+
+const AVAILABLE_YEARS: number[]    = [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025];
+const TILES_AVAILABLE_YEARS        = new Set(AVAILABLE_YEARS);
+const DEFAULT_YEAR                 = 2025;
+
+function getTileUrl(year: number): string | null {
+  return TILES_AVAILABLE_YEARS.has(year) ? `/tiles/${year}/{z}/{x}/{y}.png` : null;
+}
+
+function getCogUrl(year: number): string {
+  return `/cog/Nagpur_Weekly_${year}_cog.tif`;
+}
+
+// ─── COG TIFF Sampler — WITH FULL DEBUGGING ──────────────────────────────────
+
+interface TiffCache {
+  bands: (Float32Array | Int16Array | Uint8Array)[];  // Array of per-band typed arrays
+  width: number;
+  height: number;
+  bbox: number[];
+  nodata: number | null;
+  totalBands: number;
+}
+
+const TIFF_CACHE_MAP  = new Map<number, TiffCache>();
+const TIFF_LOADING_SET = new Set<number>();
+
+// Convenience accessor used by sampling / stats helpers (set by loadMainTiff)
+let TIFF_CACHE: TiffCache | null = null;
+let _ACTIVE_YEAR = DEFAULT_YEAR;
+
+// ─── Full-band stats helper (used during load for diagnostics) ────────────────
+function fullBandStats(band: ArrayLike<number>, nodataVal: number | null): {
+  min: number; max: number; avg: number | null; count: number; first20: number[];
+} {
+  let min = Infinity, max = -Infinity, sum = 0, count = 0;
+  const first20: number[] = [];
+  for (let i = 0; i < band.length; i++) {
+    const v = (band as any)[i] as number;
+    if (i < 20) first20.push(v);
+    // Strict: reject NaN, ±Infinity, -9999, and explicit nodata
+    if (!Number.isFinite(v) || v === -9999 || (nodataVal !== null && v === nodataVal)) continue;
+    if (v < min) min = v;
+    if (v > max) max = v;
+    sum += v;
+    count++;
+  }
+  return { min: count > 0 ? min : 0, max: count > 0 ? max : 0, avg: count > 0 ? sum / count : null, count, first20 };
+}
+
+async function loadMainTiff(year: number = DEFAULT_YEAR): Promise<TiffCache | null> {
+  if (TIFF_CACHE_MAP.has(year)) {
+    const cached = TIFF_CACHE_MAP.get(year)!;
+    TIFF_CACHE   = cached;
+    return cached;
+  }
+  if (TIFF_LOADING_SET.has(year)) return null;
+  TIFF_LOADING_SET.add(year);
+
+  try {
+    const cogUrl = getCogUrl(year);
+    const tiff = await GeoTIFF.fromUrl(cogUrl);
+
+    console.log(`=== TIFF LOAD START (year=${year}) ===`);
+    const imageCount = await tiff.getImageCount();
+    console.log("imageCount:", imageCount);
+
+    const image = await tiff.getImage();
+    const W     = image.getWidth();
+    const H     = image.getHeight();
+    const nBands = image.getSamplesPerPixel();
+    const bbox  = image.getBoundingBox();
+    const fileDirectory = image.fileDirectory as any;
+    const nodataRaw = Number(fileDirectory?.GDAL_NODATA ?? NaN);
+    const nodata = Number.isNaN(nodataRaw) ? null : nodataRaw;
+
+    console.log(`Dimensions: ${W} × ${H}  |  SamplesPerPixel: ${nBands}  |  NODATA: ${nodata}`);
+    console.log("BBOX:", bbox);
+    console.log("BitsPerSample:", fileDirectory?.BitsPerSample);
+    console.log("SampleFormat:", fileDirectory?.SampleFormat);
+
+    // ── Read all bands as separate arrays (band-sequential) ──────────────────
+    const rastersRaw = await image.readRasters();   // returns TypedArray[] per band
+    const bandsArray: (Float32Array | Int16Array | Uint8Array)[] = Array.isArray(rastersRaw)
+      ? rastersRaw as (Float32Array | Int16Array | Uint8Array)[]
+      : [rastersRaw as Float32Array | Int16Array | Uint8Array];
+
+    const totalBands = bandsArray.length;
+    console.log(`Total bands in file: ${totalBands}  (expected: ${N_WEEKS * 6} = ${N_WEEKS * 6})`);
+
+    // ── DIAGNOSTIC: print stats for ALL 6 layers × 4 sample weeks ────────────
+    // week_band = weekIndex * 6 + offset
+    // offsets: NDVI=0  LST=1  Rain=2  Soil=3  Water=4  LULC=5
+    const LAYER_NAMES = ["NDVI","LST","Rain","Soil","Water","LULC"] as const;
+    const PROBE_WEEKS = [0, 1, 10, 25];   // weeks 1, 2, 11, 26
+
+    console.log("\n=== PER-LAYER PER-WEEK BAND DIAGNOSTICS ===");
+    console.log("Format:  bandIdx | layer | week | type | min | max | avg | first5");
+    for (const wi of PROBE_WEEKS) {
+      for (let offset = 0; offset < 6; offset++) {
+        const bi = wi * 6 + offset;
+        const layerName = LAYER_NAMES[offset];
+        if (bi >= totalBands) {
+          console.warn(`  [MISSING] week${wi} ${layerName} → band ${bi} out of range (total ${totalBands})`);
+          continue;
+        }
+        const band = bandsArray[bi];
+        const s    = fullBandStats(band, nodata);
+        console.log(
+          `  band${String(bi).padStart(3," ")} | ${layerName.padEnd(5," ")} | wk${String(wi).padStart(2,"0")}` +
+          ` | ${band.constructor.name.padEnd(12," ")}` +
+          ` | min=${s.min.toFixed(4).padStart(10," ")}` +
+          ` | max=${s.max.toFixed(4).padStart(10," ")}` +
+          ` | avg=${s.avg !== null ? s.avg.toFixed(4).padStart(10," ") : "      null"}` +
+          ` | first5=[${s.first20.slice(0,5).map(v=>v.toFixed(3)).join(", ")}]`
+        );
+      }
+      console.log("  ---");
+    }
+
+    // ── SOIL-SPECIFIC DIAGNOSIS ───────────────────────────────────────────────
+    console.log("\n=== SOIL BAND DEEP DIAGNOSIS (band_index = weekIndex*6 + 3) ===");
+    const SOIL_CHECK_WEEKS = [0, 1, 2, 10];
+    for (const wi of SOIL_CHECK_WEEKS) {
+      const bi = wi * 6 + 3;
+      if (bi >= totalBands) { console.warn(`  soil week${wi} band${bi} missing`); continue; }
+      const band = bandsArray[bi];
+      const s    = fullBandStats(band, nodata);
+      console.log(`  week${wi} soil band${bi}: min=${s.min} max=${s.max} avg=${s.avg?.toFixed(4)} count=${s.count}`);
+      console.log(`    first20: [${s.first20.map(v=>v.toFixed(4)).join(", ")}]`);
+
+      // Check for saturation — if max ≤ 1.001 and min ≥ 0.999 it's clipped
+      const saturated = s.max <= 1.001 && s.min >= 0.998 && s.count > 100;
+      if (saturated) {
+        console.error(`  ⚠️  SOIL BAND ${bi} APPEARS SATURATED (all values ≈ 1.0)`);
+        console.error(`     GEE export likely used wrong divisor. Raw TerraClimate 'soil' values`);
+        console.error(`     are in mm×0.1 units (~0-4000). Dividing by 500 clips everything ≥500.`);
+        console.error(`     RECOMMENDED FIX IN GEE: .divide(500).max(0).min(1) → check raw range first.`);
+      } else if (s.max > 1.001) {
+        // Values > 1 means NOT scaled yet or scaled wrong
+        console.warn(`  ⚠️  SOIL BAND ${bi} values exceed 1.0 (max=${s.max}) — may need scaling.`);
+      } else {
+        console.log(`  ✓  SOIL BAND ${bi} looks plausible (min=${s.min.toFixed(4)} max=${s.max.toFixed(4)})`);
+      }
+    }
+
+    // ── WATER-SPECIFIC DIAGNOSIS ──────────────────────────────────────────────
+    console.log("\n=== WATER BAND DEEP DIAGNOSIS (band_index = weekIndex*6 + 4) ===");
+    for (const wi of [0, 10, 30]) {
+      const bi = wi * 6 + 4;
+      if (bi >= totalBands) continue;
+      const band = bandsArray[bi];
+      const s    = fullBandStats(band, nodata);
+      console.log(`  week${wi} water band${bi}: min=${s.min.toFixed(2)} max=${s.max.toFixed(2)} avg=${s.avg?.toFixed(2)} (expected 0–100)`);
+    }
+
+    // ── LULC-SPECIFIC DIAGNOSIS ───────────────────────────────────────────────
+    console.log("\n=== LULC BAND DEEP DIAGNOSIS (band_index = weekIndex*6 + 5) ===");
+    for (const wi of [0, 26]) {
+      const bi = wi * 6 + 5;
+      if (bi >= totalBands) continue;
+      const band = bandsArray[bi];
+      const s    = fullBandStats(band, nodata);
+      console.log(`  week${wi} lulc band${bi}: min=${s.min.toFixed(1)} max=${s.max.toFixed(1)} avg=${s.avg?.toFixed(2)} (expected 0–8 integers)`);
+    }
+
+    console.log("=== TIFF LOAD END ===\n");
+
+    const cache: TiffCache = {
+      bands: bandsArray,
+      totalBands,
+      width:  W,
+      height: H,
+      bbox,
+      nodata,
+    };
+    TIFF_CACHE_MAP.set(year, cache);
+    TIFF_CACHE = cache;
+    _ACTIVE_YEAR = year;
+
+    // Run auto-scale detection — fills DETECTED_SCALE and BAND_DIAGNOSTICS
+    detectAndLogScales(bandsArray, nodata);
+
+    // Clear any stale heatmap renders now that TIFF + scales are finalised
+    clearHeatmapCache();
+
+    return TIFF_CACHE;
+  } catch (err) {
+    console.error(`COG load failed (year=${year})`, err);
+    TIFF_LOADING_SET.delete(year);
+    return null;
+  }
+}
+
+// ─── OFFICIAL BAND OFFSETS from GEE export script ─────────────────────────────
+// band_index = week_index * 6 + layer_offset
+const BAND_OFFSETS: Record<LayerType, number> = {
+  ndvi:  0,
+  lst:   1,   // Temperature °C — CRITICAL: offset 1, NOT 0
+  rain:  2,
+  soil:  3,
+  water: 4,
+  lulc:  5,
 };
 
-const NODATA = -9999.0;
-
-function getWeekIndex(date: Date): number {
-  const start  = new Date(date.getFullYear(), 0, 1);
-  const dayIdx = Math.floor((date.getTime() - start.getTime()) / 86400000);
-  return Math.min(Math.floor(dayIdx / 7), N_WEEKS - 1);
+function getBandIndex(layer: LayerType, weekIndex: number): number {
+  return weekIndex * 6 + BAND_OFFSETS[layer];
 }
+
+function sampleTiffValue(layer: LayerType, weekIndex: number, lat: number, lng: number): number | null {
+  if (!TIFF_CACHE) return null;
+
+  const { bands, width, height, bbox, nodata } = TIFF_CACHE;
+  const [minX, minY, maxX, maxY] = bbox;
+
+  const x = Math.floor(((lng - minX) / (maxX - minX)) * width);
+  const y = Math.floor(((maxY - lat) / (maxY - minY)) * height);
+
+  if (x < 0 || x >= width || y < 0 || y >= height) return null;
+
+  const pixelIndex = y * width + x;
+  const bandIndex  = getBandIndex(layer, weekIndex);
+
+  if (bandIndex < 0 || bandIndex >= bands.length) return null;
+
+  const band = bands[bandIndex];
+  if (!band || pixelIndex >= band.length) return null;
+
+  const value = band[pixelIndex] as number;
+  if (!Number.isFinite(value) || value === nodata || value === -9999) return null;
+  // Apply per-layer scale correction detected from actual TIFF data range
+  return value * DETECTED_SCALE[layer];
+}
+
+// ─── Real TIFF Band Statistics ────────────────────────────────────────────────
+// Computes min/max/avg from actual TIFF band pixels — zero hardcoded values.
+// scaleFactor is applied to every valid pixel (1.0 = raw value, default).
+
+function computeBandStats(
+  band: Float32Array | Int16Array | Uint8Array,
+  nodata: number | null,
+  scaleFactor: number = 1,
+): {
+  min: number; max: number; avg: number | null; count: number;
+} {
+  let min   = Infinity;
+  let max   = -Infinity;
+  let sum   = 0;
+  let count = 0;
+
+  for (let i = 0; i < band.length; i++) {
+    const v = band[i] as number;
+    if (!Number.isFinite(v) || v === -9999 || (nodata !== null && v === nodata)) continue;
+    const sv = v * scaleFactor;
+    if (!Number.isFinite(sv)) continue; // guard post-scale
+    if (sv < min) min = sv;
+    if (sv > max) max = sv;
+    sum += sv;
+    count++;
+  }
+
+  return {
+    min:   count > 0 ? min : 0,
+    max:   count > 0 ? max : 0,
+    avg:   count > 0 ? sum / count : null,
+    count,
+  };
+}
+
+// Compute TIFF-derived hot/moderate/cool zone percentages from real pixel distribution
+function computeZonePcts(band: Float32Array | Int16Array | Uint8Array, nodata: number | null, _avg: number): {
+  hotPct: number; modPct: number; coolPct: number;
+} {
+  const hot   = 32;   // °C — pixels above this = "hot"
+  const cool  = 24;   // °C — pixels below this = "cool"
+  const scale = DETECTED_SCALE["lst"];
+  let hotN  = 0, coolN = 0, modN = 0;
+
+  for (let i = 0; i < band.length; i++) {
+    const raw = band[i] as number;
+    if (!Number.isFinite(raw) || raw === -9999 || (nodata !== null && raw === nodata)) continue;
+    const v = raw * scale;
+    if (!Number.isFinite(v)) continue;
+    if      (v > hot)  hotN++;
+    else if (v < cool) coolN++;
+    else               modN++;
+  }
+  const total = hotN + modN + coolN || 1;
+  return {
+    hotPct:  (hotN  / total) * 100,
+    modPct:  (modN  / total) * 100,
+    coolPct: (coolN / total) * 100,
+  };
+}
+
+// Synchronously extract real stats from the TIFF cache for the given layer+week.
+// Returns null if TIFF not yet loaded.
+function getTiffStats(layer: LayerType, weekIndex: number): RealStats | null {
+  if (!TIFF_CACHE) return null;
+  const { bands, nodata } = TIFF_CACHE;
+  const bandIndex = getBandIndex(layer, weekIndex);
+  if (bandIndex < 0 || bandIndex >= bands.length) return null;
+
+  const band  = bands[bandIndex];
+  const scale = DETECTED_SCALE[layer];
+  const stats = computeBandStats(band, nodata, scale);
+  if (stats.avg === null) return null;
+
+  let hotPct = 0, modPct = 100, coolPct = 0;
+  if (layer === "lst") {
+    const zones = computeZonePcts(band, nodata, stats.avg);
+    hotPct  = zones.hotPct;
+    modPct  = zones.modPct;
+    coolPct = zones.coolPct;
+  }
+
+  return {
+    avg:     stats.avg,
+    min:     stats.min,
+    max:     stats.max,
+    hotPct,
+    modPct,
+    coolPct,
+    count:   stats.count,
+    tiffDerived: true,
+  };
+}
+
+// Compute annual mean across all 52 weeks for a layer from TIFF data
+function getTiffAnnualMeans(): AnnualMeans | null {
+  if (!TIFF_CACHE) return null;
+  const layers: LayerType[] = ["ndvi", "lst", "rain", "soil", "water"];
+  const result: Partial<AnnualMeans> = {};
+
+  for (const layer of layers) {
+    let weekSum = 0; let weekCount = 0;
+    const scale = DETECTED_SCALE[layer];
+    for (let wi = 0; wi < N_WEEKS; wi++) {
+      const bandIndex = getBandIndex(layer, wi);
+      if (bandIndex < 0 || bandIndex >= TIFF_CACHE.bands.length) continue;
+      const band  = TIFF_CACHE.bands[bandIndex];
+      const stats = computeBandStats(band, TIFF_CACHE.nodata, scale);
+      if (stats.avg !== null) { weekSum += stats.avg; weekCount++; }
+    }
+    const key = layer === "lst" ? "lst" : layer;
+    (result as Record<string, number>)[key] = weekCount > 0 ? weekSum / weekCount : 0;
+  }
+
+  return result as AnnualMeans;
+}
+
+// ─── Auto-scale detection & per-layer scale corrections ──────────────────────
+//
+// After TIFF loads we inspect the actual data range of each layer (using week 26
+// = mid-monsoon, which has non-trivial values for all layers) and decide whether
+// the band needs a frontend scale correction because the GEE export used the
+// wrong divisor.
+//
+// RULES:
+//   NDVI:  native range −1…+1 → no scale needed
+//   LST:   native range 5…55°C → no scale needed
+//   Rain:  native range 0…500 mm/wk → no scale needed
+//   Soil:  exported as raw ÷ 500. If raw max ≤ 1.001 AND suspiciously uniform
+//          the GEE export already applied the divisor.  If raw max >> 1 (e.g. 800)
+//          we need to divide by the detected range to get 0–1.
+//   Water: native 0–100 % → no scale needed
+//   LULC:  integer 0–8 → no scale needed
+//
+// The detected SCALE_CORRECTIONS are applied by getTiffStats / sampleTiffValue.
+
+interface BandDiagnostic {
+  bandIndex:   number;
+  rawMin:      number;
+  rawMax:      number;
+  rawAvg:      number | null;
+  saturated:   boolean;   // all pixels ≈ same value → bad GEE export
+  scaleApplied: number;   // multiplier applied to raw value for display (usually 1)
+  warning:     string | null;
+}
+
+// Populated once after TIFF loads; keyed by "layer:weekIndex"
+const BAND_DIAGNOSTICS = new Map<string, BandDiagnostic>();
+
+// Per-layer scale correction factor — determined from actual TIFF data range.
+// Applied as:  displayValue = rawTiffValue * scaleFactor
+// Default = 1 (no correction).
+const DETECTED_SCALE: Record<LayerType, number> = {
+  ndvi: 1, lst: 1, rain: 1, soil: 1, water: 1, lulc: 1,
+};
+
+// Set to true once detectAndLogScales runs and soil is found temporally corrupt.
+// UI reads this to surface "UNRELIABLE — re-export GEE" warnings. Not a correction.
+let SOIL_DATA_UNRELIABLE = false;
+
+// Called once after TIFF loads — fills DETECTED_SCALE and BAND_DIAGNOSTICS
+function detectAndLogScales(bands: (Float32Array | Int16Array | Uint8Array)[], nodata: number | null) {
+  console.log("\n=== AUTO-SCALE DETECTION ===");
+
+  // Use week 26 (index 26, mid-monsoon) as reference — should have real values
+  const PROBE_WI    = 26;
+  const layerKeys   = ["ndvi", "lst", "rain", "soil", "water", "lulc"] as LayerType[];
+  const offsets     = [0, 1, 2, 3, 4, 5];
+
+  layerKeys.forEach((layer, i) => {
+    const bi   = PROBE_WI * 6 + offsets[i];
+    if (bi >= bands.length) return;
+    const band = bands[bi];
+    const s    = fullBandStats(band, nodata);
+
+    // Saturation check: >95% of valid pixels are within 0.002 of the max
+    let nearMaxCount = 0;
+    if (s.max !== s.min) {
+      for (let j = 0; j < band.length; j++) {
+        const v = (band as any)[j] as number;
+        if (!Number.isFinite(v) || v === -9999 || (nodata !== null && v === nodata)) continue;
+        if (Math.abs(v - s.max) < 0.002) nearMaxCount++;
+      }
+    }
+    const saturated = s.count > 0 && nearMaxCount / s.count > 0.95;
+
+    let scaleApplied = 1;
+    let warning: string | null = null;
+
+    if (layer === "soil") {
+      // ── Soil: check MULTIPLE weeks, not just probe week, to detect temporal corruption ──
+      // Findings from browser diagnostics:
+      //   week 0:  min≈0.9, max≈1.0, avg≈0.9998  → SATURATED (GEE .min(1) clipped)
+      //   week 10: min=0,   max=0,   avg=0         → DEAD BAND (masked / zero-fill)
+      //   week 25: min=0,   max=0,   avg=0         → DEAD BAND
+      // Conclusion: data is TEMPORALLY CORRUPT and unreliable at source.
+      // Frontend MUST NOT fabricate corrections. Mark as unreliable.
+      const soilCheckWeeks = [0, 1, 10, 25, 30];
+      let saturatedCount = 0, deadCount = 0, plausibleCount = 0;
+      for (const wi of soilCheckWeeks) {
+        const sbi = wi * 6 + 3;
+        if (sbi >= bands.length) continue;
+        const sb = bands[sbi];
+        const ss = fullBandStats(sb, nodata);
+        if (ss.count === 0 || (ss.max === 0 && ss.min === 0)) {
+          deadCount++;
+        } else if (ss.max <= 1.001 && ss.min >= 0.90 && ss.count > 50) {
+          saturatedCount++;
+        } else if (ss.max > 0.001 && ss.max <= 1.001) {
+          plausibleCount++;
+        } else if (ss.max > 1.001) {
+          // raw unscaled values
+          plausibleCount++;
+        }
+      }
+      const isTemporallyCorrupt = saturatedCount > 0 || deadCount > 0;
+      if (isTemporallyCorrupt) {
+        warning = `TEMPORALLY CORRUPT: ${saturatedCount} week(s) saturated ≈1.0 (GEE .min(1) clipping), ` +
+                  `${deadCount} week(s) fully dead (zero-fill or masked). ` +
+                  `Data is unreliable. FIX IN GEE: check raw TerraClimate range with ` +
+                  `ee.Reducer.minMax() before dividing. Some weeks may be masked by cloud/data gaps.`;
+        scaleApplied = 1; // cannot fix without re-export
+        console.error(`⚠️  SOIL TEMPORAL CORRUPTION DETECTED:`);
+        console.error(`   Saturated weeks: ${saturatedCount}, Dead weeks: ${deadCount}, Plausible weeks: ${plausibleCount}`);
+        console.error(`   ${warning}`);
+      } else if (s.max > 1.001) {
+        const correctDivisor = s.max < 10 ? 1 : s.max < 100 ? 10 : s.max < 1000 ? 100 : 500;
+        scaleApplied = 1 / correctDivisor;
+        warning = `Raw soil values out of 0–1 range (max=${s.max.toFixed(1)}). Auto-applying 1/${correctDivisor} scale.`;
+        console.warn(`⚠️  SOIL: ${warning}`);
+      } else {
+        console.log(`✓  SOIL: values in 0–1 range (min=${s.min.toFixed(3)}, max=${s.max.toFixed(3)})`);
+      }
+    } else if (layer === "water") {
+      if (s.max > 100.1) {
+        scaleApplied = 100 / s.max;
+        warning = `Raw water values exceed 100 (max=${s.max.toFixed(1)}). Auto-scaling to 0–100.`;
+        console.warn(`⚠️  WATER: ${warning}`);
+      } else if (s.max <= 1.001 && s.avg !== null && s.avg < 0.5) {
+        // Water in 0–1 fraction, not 0–100 %
+        scaleApplied = 100;
+        warning = `Water appears to be 0–1 fraction (max=${s.max.toFixed(3)}), scaling ×100 to get %.`;
+        console.warn(`⚠️  WATER: ${warning}`);
+      } else {
+        console.log(`✓  WATER: values 0–100% range (min=${s.min.toFixed(2)}, max=${s.max.toFixed(2)})`);
+      }
+    } else if (layer === "ndvi") {
+      if (s.min > -0.1 && s.max > 1.1) {
+        warning = `NDVI max=${s.max.toFixed(3)} exceeds 1.0 — possible scale error in GEE export.`;
+        console.warn(`⚠️  NDVI: ${warning}`);
+      } else {
+        console.log(`✓  NDVI: range −1…+1 (min=${s.min.toFixed(3)}, max=${s.max.toFixed(3)})`);
+      }
+    } else if (layer === "lst") {
+      if (s.min < 5 || s.max > 60) {
+        warning = `LST out of expected 5–55°C range (min=${s.min.toFixed(1)}, max=${s.max.toFixed(1)}). Check Kelvin conversion.`;
+        console.warn(`⚠️  LST: ${warning}`);
+      } else {
+        console.log(`✓  LST: ${s.min.toFixed(1)}–${s.max.toFixed(1)}°C (plausible)`);
+      }
+    } else if (layer === "rain") {
+      if (s.max > 600) {
+        warning = `Rain max=${s.max.toFixed(1)} mm/wk seems high — verify CHIRPS is weekly sum.`;
+        console.warn(`⚠️  RAIN: ${warning}`);
+      } else {
+        console.log(`✓  RAIN: 0–${s.max.toFixed(1)} mm/wk`);
+      }
+    } else if (layer === "lulc") {
+      if (s.min < -0.5 || s.max > 8.5) {
+        warning = `LULC values out of 0–8 range (min=${s.min.toFixed(1)}, max=${s.max.toFixed(1)}).`;
+        console.warn(`⚠️  LULC: ${warning}`);
+      } else {
+        console.log(`✓  LULC: classes ${s.min.toFixed(0)}–${s.max.toFixed(0)} (expected 0–8)`);
+      }
+    }
+
+    DETECTED_SCALE[layer] = scaleApplied;
+
+    // Mark soil as unreliable if temporal corruption was detected
+    if (layer === "soil" && warning !== null) {
+      SOIL_DATA_UNRELIABLE = true;
+    }
+
+    BAND_DIAGNOSTICS.set(`${layer}:${PROBE_WI}`, {
+      bandIndex: bi, rawMin: s.min, rawMax: s.max, rawAvg: s.avg,
+      saturated, scaleApplied, warning,
+    });
+
+    console.log(`   Scale factor for ${layer}: ×${scaleApplied}`);
+  });
+
+  console.log("=== AUTO-SCALE DETECTION END ===\n");
+}
+
+// Pre-warm COG TIFF so it's ready before user hovers
+function prewarmTiffs(year: number = DEFAULT_YEAR) {
+  loadMainTiff(year);
+}
+
+// ─── Date Helpers ─────────────────────────────────────────────────────────────
 
 function dateFromWeek(year: number, weekIndex: number): Date {
   const start = new Date(year, 0, 1);
@@ -52,21 +577,11 @@ function dateEndFromWeek(year: number, weekIndex: number): Date {
   return d;
 }
 
-function getBandIdx(weekIndex: number, layer: LayerType): number {
-  return weekIndex * BANDS_PER_WEEK + BAND_OFFSET[layer];
-}
-
-// ─── Date Helpers ─────────────────────────────────────────────────────────────
-
 function formatDateShort(date: Date): string {
   return date.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
 }
 
-function daysInMonth(m: number, y: number): number {
-  return new Date(y, m + 1, 0).getDate();
-}
-
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Layer Metadata ───────────────────────────────────────────────────────────
 
 const LAYER_META: Record<LayerType, { name: string; desc: string; dotColor: string; emoji: string; label: string }> = {
   lst:   { name: "Temperature", desc: "Land Surface Temp",  dotColor: "#f97316", emoji: "🌡",  label: "Temp"  },
@@ -78,7 +593,7 @@ const LAYER_META: Record<LayerType, { name: string; desc: string; dotColor: stri
 };
 
 const LAYER_LEGEND: Record<LayerType, { gradient: string; lowLabel: string; highLabel: string }> = {
-  lst:   { gradient: "linear-gradient(to right,#3b82f6,#93c5fd,#fde047,#fb923c,#ef4444,#dc2626)", lowLabel: "Cool", highLabel: "Hot" },
+  lst:   { gradient: "linear-gradient(to right,#0000c8,#00c8c8,#50ff00,#ffff00,#ff9900,#ff4100,#c80000)", lowLabel: "Cool", highLabel: "Hot" },
   ndvi:  { gradient: "linear-gradient(to right,#7f1d1d,#fde047,#16a34a)", lowLabel: "Low Veg", highLabel: "High Veg" },
   rain:  { gradient: "linear-gradient(to right,#bae6fd,#38bdf8,#0369a1)", lowLabel: "Low Rain", highLabel: "Heavy Rain" },
   soil:  { gradient: "linear-gradient(to right,#fde047,#84cc16,#166534)", lowLabel: "Dry", highLabel: "Wet" },
@@ -89,7 +604,7 @@ const LAYER_LEGEND: Record<LayerType, { gradient: string; lowLabel: string; high
 const BASEMAPS: { id: MapType; label: string; icon: React.ElementType }[] = [
   { id: "osm",       label: "OSM", icon: Globe },
   { id: "satellite", label: "SAT", icon: Satellite },
-  { id: "hybrid",    label: "HYB", icon: Map },
+  { id: "hybrid",    label: "HYB", icon: MapIcon },
 ];
 
 const DATA_SOURCES = [
@@ -113,12 +628,8 @@ const LULC_CLASSES = [
   { label: "8 Snow/Ice", color: "#e0f2fe" },
 ];
 
-const YEARS       = [2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025];
+const YEARS       = AVAILABLE_YEARS;
 const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-const WEEK_MONTH_LABELS = Array.from({ length: N_WEEKS }, (_, i) => {
-  const d = new Date(2024, 0, 1 + i * 7);
-  return MONTH_NAMES[d.getMonth()];
-});
 
 const sectionLabel: React.CSSProperties = {
   fontSize: 11, fontWeight: 700, color: "#374151",
@@ -254,12 +765,12 @@ const LAYER_INFO: Record<LayerType, LayerInfoDetail> = {
     ],
     unit: "Millimetres (mm) — weekly total",
     valueRanges: [
-      { range: "0 mm",           meaning: "No rain — dry week",                      color: "#e0f2fe" },
-      { range: "0.1 – 10 mm",   meaning: "Trace/light weekly total",                color: "#7dd3fc" },
-      { range: "10 – 30 mm",    meaning: "Moderate rain week",                      color: "#38bdf8" },
-      { range: "30 – 60 mm",    meaning: "Heavy rain — active monsoon week",        color: "#0284c7" },
-      { range: "60 – 120 mm",   meaning: "Very heavy — intense monsoon event",      color: "#1d4ed8" },
-      { range: "> 120 mm",      meaning: "Extreme — flood-risk level",              color: "#1e3a8a" },
+      { range: "0 mm",         meaning: "No rain — dry week",                  color: "#e0f2fe" },
+      { range: "0.1 – 10 mm",  meaning: "Trace/light weekly total",            color: "#7dd3fc" },
+      { range: "10 – 30 mm",   meaning: "Moderate rain week",                  color: "#38bdf8" },
+      { range: "30 – 60 mm",   meaning: "Heavy rain — active monsoon week",    color: "#0284c7" },
+      { range: "60 – 120 mm",  meaning: "Very heavy — intense monsoon event",  color: "#1d4ed8" },
+      { range: "> 120 mm",     meaning: "Extreme — flood-risk level",          color: "#1e3a8a" },
     ],
     chartExplain: "% bar = area that received >20mm that week. Nagpur receives ~1,100mm annually, mostly Jun–Sep.",
     notes: "Nagpur lies in Vidarbha, known for erratic monsoon with intense rainfall events. Normal onset: ~15 June. Peak: July–August.",
@@ -281,84 +792,470 @@ const LAYER_INFO: Record<LayerType, LayerInfoDetail> = {
     ],
     unit: "Fraction 0–1 (0% = completely dry, 100% = field capacity)",
     valueRanges: [
-      { range: "0 – 0.10",  meaning: "Very dry — Nagpur summer drought stress", color: "#fde047" },
-      { range: "0.10 – 0.25", meaning: "Dry — pre-monsoon / post-harvest",      color: "#a3e635" },
-      { range: "0.25 – 0.45", meaning: "Moderate — adequate for crops",         color: "#84cc16" },
-      { range: "0.45 – 0.65", meaning: "Moist — active monsoon / irrigation",   color: "#4ade80" },
-      { range: "0.65 – 0.80", meaning: "Wet — post-monsoon saturated soil",     color: "#16a34a" },
-      { range: "> 0.80",      meaning: "Saturated — waterlogged risk",          color: "#166534" },
+      { range: "0 – 0.10",    meaning: "Very dry — Nagpur summer drought stress", color: "#fde047" },
+      { range: "0.10 – 0.25", meaning: "Dry — pre-monsoon / post-harvest",        color: "#a3e635" },
+      { range: "0.25 – 0.45", meaning: "Moderate — adequate for crops",           color: "#84cc16" },
+      { range: "0.45 – 0.65", meaning: "Moist — active monsoon / irrigation",     color: "#4ade80" },
+      { range: "0.65 – 0.80", meaning: "Wet — post-monsoon saturated soil",       color: "#16a34a" },
+      { range: "> 0.80",      meaning: "Saturated — waterlogged risk",            color: "#166534" },
     ],
     chartExplain: "% bar = area with soil moisture > 0.3 (30% field capacity). TerraClimate is monthly so values change smoothly week to week.",
     notes: "Nagpur's black cotton soil (Vertisols) has high water retention. Stays dry Apr–Jun, peaks Sep–Oct post-monsoon.",
   },
 };
 
-// ─── Color Scales ─────────────────────────────────────────────────────────────
+// ─── Stats resolver: TIFF-first, loading placeholder if TIFF not ready ────────
+// Returns real TIFF pixel stats when cache is loaded, otherwise a loading state.
 
-function interp(stops: [number,number,number,number][], r: number): [number,number,number] {
-  let lo = stops[0], hi = stops[stops.length - 1];
-  for (let i = 0; i < stops.length - 1; i++) {
-    if (r >= stops[i][0] && r <= stops[i+1][0]) { lo = stops[i]; hi = stops[i+1]; break; }
+function getWeekStats(layer: LayerType, weekIndex: number): RealStats {
+  const tiff = getTiffStats(layer, weekIndex);
+  if (tiff) {
+    return { ...tiff, tiffDerived: true };
   }
-  const f = (r - lo[0]) / ((hi[0] - lo[0]) || 1);
-  return [Math.round(lo[1]+f*(hi[1]-lo[1])), Math.round(lo[2]+f*(hi[2]-lo[2])), Math.round(lo[3]+f*(hi[3]-lo[3]))];
+  // TIFF not loaded yet — return zeros so UI renders without crashing
+  return { avg: 0, min: 0, max: 0, hotPct: 0, modPct: 100, coolPct: 0, count: 0, tiffDerived: false };
 }
-function nrm(v: number, lo: number, hi: number) { return Math.max(0, Math.min(1, (v-lo)/((hi-lo)||1))); }
-function tempToColor(v: number, mn: number, mx: number): [number,number,number] {
-  return interp([[0,13,2,33],[0.15,59,7,100],[0.30,124,13,110],[0.46,160,30,50],[0.60,231,76,60],[0.74,243,156,18],[0.87,241,196,15],[1,255,253,231]], nrm(v,mn,mx));
+
+// Annual means: computed from all 52 TIFF bands per layer, or null if not loaded
+function computeAnnualMeans(): AnnualMeans {
+  const tiff = getTiffAnnualMeans();
+  if (tiff) return tiff;
+  return { ndvi: 0, lst: 0, rain: 0, soil: 0, water: 0 };
 }
-function ndviToColor(v: number, mn: number, mx: number): [number,number,number] {
-  return interp([[0,127,29,29],[0.5,253,224,71],[1,22,163,74]], nrm(v,mn,mx));
-}
-function rainToColor(v: number, mn: number, mx: number): [number,number,number] {
-  return interp([[0,186,230,253],[0.5,56,189,248],[1,3,105,161]], nrm(v,mn,mx));
-}
-function soilToColor(v: number, mn: number, mx: number): [number,number,number] {
-  return interp([[0,253,224,71],[0.5,132,204,22],[1,22,101,52]], nrm(v,mn,mx));
-}
-function waterToColor(v: number, mn: number, mx: number): [number,number,number] {
-  return interp([[0,224,242,254],[0.5,56,189,248],[1,3,105,161]], nrm(v,mn,mx));
-}
-function lulcToColor(v: number): [number,number,number] {
-  const c: [number,number,number][] = [[29,78,216],[21,128,61],[134,239,172],[103,232,249],[202,138,4],[132,204,22],[249,115,22],[161,98,7],[224,242,254]];
-  const cls = Math.round(v);
-  return (cls >= 0 && cls <= 8) ? c[cls] : [156,163,175];
-}
-function getColor(v: number, layer: LayerType, mn: number, mx: number): [number,number,number] {
-  switch (layer) {
-    case "ndvi":  return ndviToColor(v, mn, mx);
-    case "rain":  return rainToColor(v, mn, mx);
-    case "soil":  return soilToColor(v, mn, mx);
-    case "water": return waterToColor(v, mn, mx);
-    case "lulc":  return lulcToColor(v);
-    default:      return tempToColor(v, mn, mx);
+
+// ─── Canvas Dense TIFF-Pixel Heatmap Overlay ─────────────────────────────────
+// Renders REAL TIFF pixel values as a dense, colourised heatmap — matching the
+// old dashboard's immersive raster appearance.
+//
+// VISUAL ONLY — all analytics / tooltips continue to use TIFF-derived values.
+//
+// Architecture:
+//   • PNG XYZ tiles  → base performance rendering (unchanged)
+//   • This canvas   → dense TIFF-pixel visual overlay (upgraded)
+//   • COG TIFF      → analytics + tooltips (unchanged)
+//
+// Rendering rules (from spec):
+//   1. Read REAL pixel values from active TIFF band for the current week
+//   2. Map values → RGBA using per-layer colour ramps
+//   3. Skip invalid pixels (NaN / nodata) → stay transparent
+//   4. Apply Gaussian-style alpha via a 3×3 box blur pass
+//   5. Feather edges (distance-to-edge fade)
+//   6. Cache rendered ImageBitmap per (layer, week)
+//   7. Re-render only on: layer change, week change, map zoomend/moveend
+//   8. Debounce re-render (200ms) — NEVER repaint during drag/pan
+
+// Map viewport bounds and tooltip sampling area.
+// Heatmap overlay uses actual TIFF bbox (from cache) to avoid geographic cutting.
+const NAGPUR_BBOX = { minLat: 20.70, maxLat: 21.58, minLng: 78.65, maxLng: 79.70 };
+
+// ── Absolute Temperature Color Scale for LST ─────────────────────────────────
+// Designed for Nagpur's actual range (Jan ~19–32°C, May ~35–48°C):
+//   ≤ 10°C  → Deep Blue
+//   10–15°C → Blue → Cyan
+//   15–20°C → Cyan → Lime Green
+//   20–25°C → Lime Green → Yellow-Green
+//   25–30°C → Yellow-Green → Yellow → Orange-Yellow
+//   30–36°C → Orange-Yellow → Orange
+//   36–42°C → Orange → Red-Orange
+//   > 42°C  → Deep Red
+function getLSTColor(temp: number): [number, number, number] {
+  if (temp <= 10) return [0, 0, 200];
+  if (temp <= 15) {
+    const t = (temp - 10) / 5;
+    return [0, Math.round(100 + t * 155), Math.round(200 - t * 50)];  // Blue → Cyan
   }
+  if (temp <= 20) {
+    const t = (temp - 15) / 5;
+    return [Math.round(t * 80), Math.round(255), Math.round(150 - t * 150)]; // Cyan → Lime
+  }
+  if (temp <= 25) {
+    const t = (temp - 20) / 5;
+    return [Math.round(80 + t * 175), 255, 0]; // Lime → Yellow
+  }
+  if (temp <= 30) {
+    const t = (temp - 25) / 5;
+    return [255, Math.round(255 - t * 90), 0]; // Yellow → Orange-Yellow
+  }
+  if (temp <= 36) {
+    const t = (temp - 30) / 6;
+    return [255, Math.round(165 - t * 100), 0]; // Orange-Yellow → Orange
+  }
+  if (temp <= 42) {
+    const t = (temp - 36) / 6;
+    return [255, Math.round(65 - t * 65), 0]; // Orange → Red
+  }
+  return [200, 0, 0]; // Deep Red
 }
 
-// ─── Layer Ranges ─────────────────────────────────────────────────────────────
+// ── Per-layer colour ramps (kept for non-LST) ────────────────────────────────
+function lerpColour(c1: [number,number,number], c2: [number,number,number], t: number): [number,number,number] {
+  return [
+    Math.round(c1[0] + (c2[0] - c1[0]) * t),
+    Math.round(c1[1] + (c2[1] - c1[1]) * t),
+    Math.round(c1[2] + (c2[2] - c1[2]) * t),
+  ];
+}
 
-const LAYER_RANGE: Record<LayerType, { min: number; max: number }> = {
-  lst:   { min: 5,    max: 55  },
-  ndvi:  { min: -0.2, max: 0.9 },
-  rain:  { min: 0,    max: 120 },
-  soil:  { min: 0,    max: 1   },
-  water: { min: 0,    max: 100 },
-  lulc:  { min: 0,    max: 8   },
+function sampleRamp(stops: [number, [number,number,number]][], t: number): [number,number,number] {
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const lo = stops[i-1], hi = stops[i];
+      const tt = (t - lo[0]) / (hi[0] - lo[0]);
+      return lerpColour(lo[1], hi[1], tt);
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+// NDVI, Rain, etc. ramps (unchanged)
+const NDVI_RAMP: [number,[number,number,number]][] = [
+  [0.00, [127, 29, 29]],
+  [0.30, [161, 98, 7]],
+  [0.50, [253,224,71]],
+  [0.70, [101,163,13]],
+  [1.00, [20,  83, 45]],
+];
+
+const RAIN_RAMP: [number,[number,number,number]][] = [
+  [0.00, [224,242,254]],
+  [0.30, [125,211,252]],
+  [0.60, [56, 189,248]],
+  [0.80, [2, 132,199]],
+  [1.00, [30,  58,138]],
+];
+
+const SOIL_RAMP: [number,[number,number,number]][] = [
+  [0.00, [253,224, 71]],
+  [0.35, [163,230, 53]],
+  [0.65, [132,204, 22]],
+  [1.00, [22, 101, 52]],
+];
+
+const WATER_RAMP: [number,[number,number,number]][] = [
+  [0.00, [224,242,254]],
+  [0.30, [125,211,252]],
+  [0.70, [56, 189,248]],
+  [1.00, [29,  78,216]],
+];
+
+const LULC_COLOURS: [number,number,number][] = [
+  [29, 78,216],   // 0 Water
+  [21,128, 61],   // 1 Trees
+  [134,239,172],  // 2 Grass
+  [103,232,249],  // 3 Flooded
+  [202,138,  4],  // 4 Crops
+  [132,204, 22],  // 5 Shrub
+  [249,115, 22],  // 6 Built
+  [161, 98,  7],  // 7 Bare
+  [224,242,254],  // 8 Snow/Ice
+];
+
+interface LayerValueRange {
+  min: number;
+  max: number;
+}
+
+const LAYER_VALUE_RANGES: Record<LayerType, LayerValueRange> = {
+  lst:   { min: 8,   max: 50  },   // °C
+  ndvi:  { min: -0.1, max: 0.85},
+  rain:  { min: 0,   max: 120 },   // mm/wk
+  soil:  { min: 0,   max: 1   },   // fraction
+  water: { min: 0,   max: 100 },   // %
+  lulc:  { min: 0,   max: 8   },   // class
 };
 
-function computeRange(band: any, hintMin: number, hintMax: number): [number, number] {
-  const vals: number[] = [];
-  for (let i = 0; i < band.length; i++) {
-    const v = band[i];
-    if (v == null || isNaN(v) || v <= NODATA + 1) continue;
-    vals.push(v);
+function valueToRGBA(layer: LayerType, v: number): [number,number,number,number] {
+  if (layer === "lst") {
+    const [r, g, b] = getLSTColor(v);
+    return [r, g, b, 220]; // Slightly higher opacity for visibility
   }
-  if (!vals.length) return [hintMin, hintMax];
-  vals.sort((a, b) => a - b);
-  const lo = vals[Math.floor(vals.length * 0.02)];
-  const hi = vals[Math.floor(vals.length * 0.98)];
-  return (!isFinite(lo) || !isFinite(hi) || lo === hi) ? [hintMin, hintMax] : [lo, hi];
+
+  if (layer === "lulc") {
+    const cls = Math.max(0, Math.min(8, Math.round(v)));
+    const [r,g,b] = LULC_COLOURS[cls] ?? [160,160,160];
+    return [r, g, b, 210];
+  }
+
+  const range = LAYER_VALUE_RANGES[layer];
+  const t = (v - range.min) / (range.max - range.min);
+
+  let rgb: [number,number,number];
+  switch (layer) {
+    case "ndvi":  rgb = sampleRamp(NDVI_RAMP,  t); break;
+    case "rain":  rgb = sampleRamp(RAIN_RAMP,  t); break;
+    case "soil":  rgb = sampleRamp(SOIL_RAMP,  t); break;
+    case "water": rgb = sampleRamp(WATER_RAMP, t); break;
+    default:      rgb = [160,160,160];
+  }
+  return [...rgb, 210] as [number,number,number,number];
 }
+
+// 3x3 box blur — sparse-region safe.
+// RULE: if a pixel is valid (alpha > 0) but ALL neighbours are transparent,
+// preserve the original pixel exactly rather than wiping it to 0.
+// This prevents isolated finite TIFF pixels disappearing in the blur pass.
+function boxBlur(data: Uint8ClampedArray, W: number, H: number): Uint8ClampedArray<ArrayBuffer> {
+  const out = new Uint8ClampedArray(data.length) as Uint8ClampedArray<ArrayBuffer>;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i4 = (y * W + x) * 4;
+      let r=0,g=0,b=0,a=0, n=0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x+dx, ny = y+dy;
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+          const i = (ny*W+nx)*4;
+          if (data[i+3] === 0) continue; // skip transparent neighbours
+          r += data[i]; g += data[i+1]; b += data[i+2]; a += data[i+3]; n++;
+        }
+      }
+      if (n === 0) {
+        // No valid neighbours — if this pixel itself is valid, preserve it exactly
+        if (data[i4+3] > 0) {
+          out[i4] = data[i4]; out[i4+1] = data[i4+1];
+          out[i4+2] = data[i4+2]; out[i4+3] = data[i4+3];
+        }
+        continue;
+      }
+      out[i4] = r/n; out[i4+1] = g/n; out[i4+2] = b/n; out[i4+3] = a/n;
+    }
+  }
+  return out;
+}
+
+// Rendered frame cache — keyed by "year:layer:weekIndex"
+const HEATMAP_CACHE = new Map<string, string>(); // key → dataURL
+let HEATMAP_CACHE_YEAR = DEFAULT_YEAR; // track which year cache belongs to
+
+// Clear cache when TIFF loads (called after detectAndLogScales)
+function clearHeatmapCache() {
+  HEATMAP_CACHE.clear();
+  HEATMAP_CACHE_YEAR = _ACTIVE_YEAR;
+}
+
+function renderHeatmapToDataUrl(layer: LayerType, weekIndex: number): string | null {
+  if (!TIFF_CACHE) return null;
+
+  // If cache belongs to a different year, clear it
+  if (HEATMAP_CACHE_YEAR !== _ACTIVE_YEAR) {
+    HEATMAP_CACHE.clear();
+    HEATMAP_CACHE_YEAR = _ACTIVE_YEAR;
+  }
+
+  const cacheKey = `${_ACTIVE_YEAR}:${layer}:${weekIndex}`;
+  if (HEATMAP_CACHE.has(cacheKey)) return HEATMAP_CACHE.get(cacheKey)!;
+
+  const { bands, width: tw, height: th, bbox: tiffBbox, nodata } = TIFF_CACHE;
+
+  const bandIndex = getBandIndex(layer, weekIndex);
+  if (bandIndex < 0 || bandIndex >= bands.length) return null;
+  const band = bands[bandIndex];
+  const scale = DETECTED_SCALE[layer];
+
+  // Use actual TIFF bbox for the overlay so no data is cut off.
+  // Overlay covers the full TIFF extent — Leaflet clips to visible map area automatically.
+  const [tiffMinXFull, tiffMinYFull, tiffMaxXFull, tiffMaxYFull] = tiffBbox;
+  const overlayMinLng = tiffMinXFull;
+  const overlayMaxLng = tiffMaxXFull;
+  const overlayMinLat = tiffMinYFull;
+  const overlayMaxLat = tiffMaxYFull;
+
+  const tiffLngSpan    = tiffMaxXFull - tiffMinXFull;
+  const tiffLatSpan    = tiffMaxYFull - tiffMinYFull;
+  const overlayLngSpan = overlayMaxLng - overlayMinLng;
+  const overlayLatSpan = overlayMaxLat - overlayMinLat;
+
+  const tiffPpd_x = tw / tiffLngSpan;
+  const tiffPpd_y = th / tiffLatSpan;
+
+  const W_raw = Math.round(overlayLngSpan * tiffPpd_x);
+  const H_raw = Math.round(overlayLatSpan * tiffPpd_y);
+  const UPSCALE = 1; // No upscale for nearest-neighbor crispness
+  const W = Math.max(1, W_raw * UPSCALE);
+  const H = Math.max(1, H_raw * UPSCALE);
+
+  console.log(`[Heatmap ${layer} wk${weekIndex}] Render: Canvas=${W}x${H}`);
+
+  const imgData = new Uint8ClampedArray(W * H * 4);
+  let finitePixelCount = 0;
+
+  for (let cy = 0; cy < H; cy++) {
+    const lat = overlayMaxLat - (cy / H) * overlayLatSpan;
+    for (let cx = 0; cx < W; cx++) {
+      const lng = overlayMinLng + (cx / W) * overlayLngSpan;
+
+      const tx = Math.floor(((lng - tiffMinXFull) / tiffLngSpan) * tw);
+      const ty = Math.floor(((tiffMaxYFull - lat)  / tiffLatSpan) * th);
+
+      if (tx < 0 || tx >= tw || ty < 0 || ty >= th) continue;
+
+      const ti  = ty * tw + tx;
+      const raw = (band as any)[ti] as number;
+
+      // STRICT NODATA FILTER
+      if (!Number.isFinite(raw) || raw === -9999 || (nodata !== null && raw === nodata)) {
+        continue;
+      }
+
+      const v = raw * scale;
+      if (!Number.isFinite(v)) continue;
+
+      const [r, g, b, a] = valueToRGBA(layer, v);
+      const i4 = (cy * W + cx) * 4;
+      imgData[i4]   = r;
+      imgData[i4+1] = g;
+      imgData[i4+2] = b;
+      imgData[i4+3] = a;
+      finitePixelCount++;
+    }
+  }
+
+  // ── Save strict mask BEFORE any alpha modification ────────────────────────
+  const hasData = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    if (imgData[i * 4 + 3] > 0) hasData[i] = 1;
+  }
+
+  // Minimal feathering only on boundaries
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i4 = (y * W + x) * 4;
+      if (imgData[i4+3] === 0) continue;
+
+      let transparentN = 0, totalN = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = x+dx, ny = y+dy;
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+          totalN++;
+          if (imgData[(ny*W+nx)*4+3] === 0) transparentN++;
+        }
+      }
+      if (transparentN === 0) continue;
+      const feather  = 1.0 - (transparentN / totalN) * 0.35;
+      imgData[i4+3]  = Math.round(imgData[i4+3] * feather);
+    }
+  }
+
+  const blurred = boxBlur(imgData, W, H);
+
+  // STRICT MASK ENFORCEMENT — no bleed
+  for (let i = 0; i < W * H; i++) {
+    if (!hasData[i]) {
+      blurred[i * 4]     = 0;
+      blurred[i * 4 + 1] = 0;
+      blurred[i * 4 + 2] = 0;
+      blurred[i * 4 + 3] = 0;
+    }
+  }
+
+  console.log(`[Heatmap ${layer} wk${weekIndex}] Finite pixels: ${finitePixelCount}`);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d")!;
+  ctx.imageSmoothingEnabled = false; // CRITICAL: nearest-neighbor
+
+  const imageData = new ImageData(blurred as Uint8ClampedArray<ArrayBuffer>, W, H);
+  ctx.putImageData(imageData, 0, 0);
+
+  const dataUrl = canvas.toDataURL("image/png");
+  HEATMAP_CACHE.set(cacheKey, dataUrl);
+  return dataUrl;
+}
+
+const CanvasHeatmapLayer = React.memo(({ activeLayer, weekIndex, year }: {
+  activeLayer: LayerType; weekIndex: number; year: number;
+}) => {
+  const map        = useMap();
+  const overlayRef = useRef<L.ImageOverlay | null>(null);
+  const debounceRef= useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef<boolean>(false);
+  const isDragging = useRef(false);
+
+  const getBoundsFromTiff = useCallback((): L.LatLngBoundsExpression => {
+    if (TIFF_CACHE) {
+      const [minX, minY, maxX, maxY] = TIFF_CACHE.bbox;
+      return [[minY, minX], [maxY, maxX]];
+    }
+    return [
+      [NAGPUR_BBOX.minLat, NAGPUR_BBOX.minLng],
+      [NAGPUR_BBOX.maxLat, NAGPUR_BBOX.maxLng],
+    ];
+  }, []);
+
+  const applyOverlay = useCallback((dataUrl: string) => {
+    const activeBounds = getBoundsFromTiff();
+    if (overlayRef.current) {
+      overlayRef.current.setUrl(dataUrl);
+      overlayRef.current.setBounds(L.latLngBounds(activeBounds as L.LatLngBoundsLiteral));
+      overlayRef.current.setOpacity(0.85);
+    } else {
+      const overlay = L.imageOverlay(dataUrl, activeBounds, {
+        opacity: 0.85,
+        zIndex: 200,
+        interactive: false,
+        className: "nagpur-heat-overlay",
+      });
+      overlay.addTo(map);
+      overlayRef.current = overlay;
+    }
+  }, [map, getBoundsFromTiff]);
+
+  const scheduleRender = useCallback(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      if (isDragging.current) { pendingRef.current = true; return; }
+      requestAnimationFrame(() => {
+        if (!TIFF_CACHE) return; // CRITICAL: Only render after TIFF loaded
+        const dataUrl = renderHeatmapToDataUrl(activeLayer, weekIndex);
+        if (dataUrl) {
+          applyOverlay(dataUrl);
+        }
+      });
+    }, 180);
+  }, [activeLayer, weekIndex, applyOverlay]);
+
+  // Re-render on layer/week change ONLY if TIFF ready
+  useEffect(() => {
+    if (TIFF_CACHE) scheduleRender();
+  }, [scheduleRender]);
+
+  useEffect(() => {
+    const onDragStart = () => { isDragging.current = true; };
+    const onDragEnd   = () => {
+      isDragging.current = false;
+      if (pendingRef.current) { pendingRef.current = false; scheduleRender(); }
+    };
+    const onSettled   = () => { if (!isDragging.current && TIFF_CACHE) scheduleRender(); };
+
+    map.on("dragstart",  onDragStart);
+    map.on("dragend",    onDragEnd);
+    map.on("zoomend",    onSettled);
+    map.on("moveend",    onSettled);
+
+    return () => {
+      map.off("dragstart", onDragStart);
+      map.off("dragend",   onDragEnd);
+      map.off("zoomend",   onSettled);
+      map.off("moveend",   onSettled);
+    };
+  }, [map, scheduleRender]);
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (overlayRef.current) {
+        map.removeLayer(overlayRef.current);
+        overlayRef.current = null;
+      }
+    };
+  }, [map]);
+
+  return null;
+});
 
 // ─── Card ─────────────────────────────────────────────────────────────────────
 
@@ -390,28 +1287,19 @@ function SummaryGrid({ items }: {
 
 // ─── Annual Means Panel ───────────────────────────────────────────────────────
 
-function AnnualMeansPanel({ means, year }: { means: AnnualMeans | null; year: number }) {
-  if (!means) {
-    return (
-      <Card style={{ padding: "14px 16px" }}>
-        <p style={sectionLabel}>{year} Annual Means</p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {[0,1,2,3,4].map(i => <div key={i} style={{ height: 28, background: "#f1f5f9", borderRadius: 8 }} />)}
-          <p style={{ fontSize: 10, color: "#9ca3af", textAlign: "center" }}>Computing annual means…</p>
-        </div>
-      </Card>
-    );
-  }
+function AnnualMeansPanel({ means, year }: { means: AnnualMeans; year: number }) {
+  const loaded = means.lst > 0 || means.ndvi > 0;
+  const fmt = (v: number, decimals: number) => loaded ? v.toFixed(decimals) : "—";
   const rows = [
-    { label: "🌿 NDVI",          value: means.ndvi.toFixed(3),              note: "avg greenness", color: "#16a34a", bg: "#f0fdf4" },
-    { label: "🌡️ Temperature",   value: `${means.lst.toFixed(1)} °C`,        note: "avg LST",       color: "#ea580c", bg: "#fff7ed" },
-    { label: "🌧️ Rain",          value: `${means.rain.toFixed(1)} mm/wk`,    note: "avg weekly",    color: "#0284c7", bg: "#f0f9ff" },
-    { label: "🌱 Soil Moisture",  value: `${(means.soil*100).toFixed(1)} %`, note: "avg fraction",  color: "#65a30d", bg: "#f7fee7" },
-    { label: "💧 Water Cover",    value: `${means.water.toFixed(1)} %`,       note: "avg water",     color: "#0891b2", bg: "#ecfeff" },
+    { label: "🌿 NDVI",         value: loaded ? means.ndvi.toFixed(3) : "—",                           note: "avg greenness", color: "#16a34a", bg: "#f0fdf4" },
+    { label: "🌡️ Temperature",  value: loaded ? `${means.lst.toFixed(1)} °C` : "—",                     note: "avg LST",       color: "#ea580c", bg: "#fff7ed" },
+    { label: "🌧️ Rain",         value: loaded ? `${means.rain.toFixed(1)} mm/wk` : "—",                 note: "avg weekly",    color: "#0284c7", bg: "#f0f9ff" },
+    { label: "🌱 Soil Moisture", value: SOIL_DATA_UNRELIABLE ? "⚠️ Unreliable" : (loaded ? `${(means.soil*100).toFixed(1)} %` : "—"),              note: SOIL_DATA_UNRELIABLE ? "source corrupted" : "avg fraction",  color: SOIL_DATA_UNRELIABLE ? "#dc2626" : "#65a30d", bg: SOIL_DATA_UNRELIABLE ? "#fef2f2" : "#f7fee7" },
+    { label: "💧 Water Cover",   value: loaded ? `${means.water.toFixed(1)} %` : "—",                   note: "avg water",     color: "#0891b2", bg: "#ecfeff" },
   ];
   return (
     <Card style={{ padding: "14px 16px" }}>
-      <p style={sectionLabel}>{year} Annual Means</p>
+      <p style={sectionLabel}>{year} Annual Means · Real Climatology</p>
       <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
         {rows.map(r => (
           <div key={r.label} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: r.bg, borderRadius: 9, padding: "7px 10px" }}>
@@ -423,13 +1311,18 @@ function AnnualMeansPanel({ means, year }: { means: AnnualMeans | null; year: nu
           </div>
         ))}
       </div>
+      <div style={{ marginTop: 8, padding: "5px 8px", background: "#f0fdf4", borderRadius: 7, border: "1px solid #bbf7d0" }}>
+        <span style={{ fontSize: 9, color: "#15803d", fontWeight: 600 }}>
+          Source: COG TIFF Band Means · All 52 Weeks · Real Pixels
+        </span>
+      </div>
     </Card>
   );
 }
 
 // ─── Data Sources Panel ───────────────────────────────────────────────────────
 
-function DataSourcesPanel() {
+function DataSourcesPanel({ year }: { year: number }) {
   return (
     <Card style={{ padding: "14px 16px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
@@ -448,8 +1341,7 @@ function DataSourcesPanel() {
         ))}
         <div style={{ marginTop: 4, padding: "5px 8px", background: "#f5f3ff", borderRadius: 7, border: "1px solid #ede9fe" }}>
           <span style={{ fontSize: 9, color: "#7c3aed", fontWeight: 600 }}>Scale: 500m · CRS: EPSG:4326</span><br />
-          <span style={{ fontSize: 9, color: "#9ca3af" }}>6 bands × 52 weeks = 312 bands/year</span><br />
-          <span style={{ fontSize: 9, color: "#9ca3af" }}>Band formula: week_index × 6 + offset</span>
+          <span style={{ fontSize: 9, color: "#9ca3af" }}>Tiles: XYZ PNG · public/tiles/{year}/{"{z}/{x}/{y}"}.png</span>
         </div>
       </div>
     </Card>
@@ -461,24 +1353,27 @@ function DataSourcesPanel() {
 function InfoTab({ activeLayer, onClose }: { activeLayer: LayerType; onClose: () => void }) {
   const info = LAYER_INFO[activeLayer];
   return (
-    <div style={{ position: "fixed", top: 0, left: 0, bottom: 0, width: 340, zIndex: 2000, background: "#fff", borderRight: `3px solid ${info.accentColor}`, boxShadow: "4px 0 32px rgba(0,0,0,0.18)", display: "flex", flexDirection: "column", fontFamily: "'Inter', system-ui, sans-serif", overflowY: "auto", animation: "slideInLeft 0.22s cubic-bezier(0.22,1,0.36,1)" }}>
-      <style>{`@keyframes slideInLeft{from{transform:translateX(-100%);opacity:0}to{transform:translateX(0);opacity:1}} .info-scroll::-webkit-scrollbar{width:4px} .info-scroll::-webkit-scrollbar-thumb{background:${info.accentColor};border-radius:4px}`}</style>
-      <div style={{ background: `linear-gradient(135deg, ${info.accentColor}22 0%, ${info.accentColor}08 100%)`, borderBottom: `1px solid ${info.accentColor}33`, padding: "16px 16px 14px", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
-          <div style={{ flex: 1 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-              <span style={{ fontSize: 26 }}>{info.emoji}</span>
-              <div>
-                <div style={{ fontSize: 12, fontWeight: 700, color: info.accentColor, textTransform: "uppercase", letterSpacing: "0.08em" }}>Layer Info</div>
-                <div style={{ fontSize: 15, fontWeight: 800, color: "#111827", lineHeight: 1.3 }}>{info.title}</div>
-              </div>
+    <div style={{
+      position: "absolute", top: 0, left: 0, width: 340, height: "100vh",
+      background: "#fff", borderRight: "1px solid #e5e7eb",
+      boxShadow: "4px 0 24px rgba(0,0,0,0.10)", zIndex: 800,
+      display: "flex", flexDirection: "column", overflow: "hidden",
+    }}>
+      <div style={{ padding: "14px 14px 10px", borderBottom: "1px solid #e5e7eb", background: info.bgColor, flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
+              <span style={{ fontSize: 22, lineHeight: 1 }}>{info.emoji}</span>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "#111827", lineHeight: 1.3 }}>{info.title}</div>
             </div>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
               <span style={{ fontSize: 11, fontWeight: 700, background: info.accentColor, color: "#fff", borderRadius: 6, padding: "3px 8px" }}>{info.sourceShort}</span>
               <span style={{ fontSize: 11, fontWeight: 600, background: "#f5f3ff", color: "#7c3aed", borderRadius: 6, padding: "3px 8px" }}>{info.resolution}</span>
             </div>
           </div>
-          <button onClick={onClose} style={{ background: "#f1f5f9", border: "none", borderRadius: 8, width: 28, height: 28, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginLeft: 8 }}><X size={14} color="#6b7280" /></button>
+          <button onClick={onClose} style={{ background: "#f1f5f9", border: "none", borderRadius: 8, width: 28, height: 28, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginLeft: 8 }}>
+            <X size={14} color="#6b7280" />
+          </button>
         </div>
       </div>
       <div className="info-scroll" style={{ flex: 1, overflowY: "auto", padding: "14px 14px 20px" }}>
@@ -536,39 +1431,181 @@ function InfoTab({ activeLayer, onClose }: { activeLayer: LayerType; onClose: ()
   );
 }
 
-// ─── Analytics Content ────────────────────────────────────────────────────────
+// ─── Band Diagnostics Panel ───────────────────────────────────────────────────
+// Shows raw TIFF band values for the current layer — pinpoints GEE export issues.
+// Displays for all 4 probe weeks so you can see if values vary across time.
+
+function BandDiagnosticsPanel({ activeLayer, weekIndex }: { activeLayer: LayerType; weekIndex: number }) {
+  if (!TIFF_CACHE) return null;
+
+  const PROBE_WEEKS = [0, 1, 10, 25];
+  const rows = PROBE_WEEKS.map(wi => {
+    const bi   = wi * 6 + BAND_OFFSETS[activeLayer];
+    if (bi >= TIFF_CACHE!.bands.length) return { wi, bi, s: null };
+    const band = TIFF_CACHE!.bands[bi];
+    const s    = fullBandStats(band, TIFF_CACHE!.nodata);
+    return { wi, bi, s };
+  });
+
+  const curBi   = weekIndex * 6 + BAND_OFFSETS[activeLayer];
+  const curBand = curBi < TIFF_CACHE.bands.length ? TIFF_CACHE.bands[curBi] : null;
+  const curRaw  = curBand ? fullBandStats(curBand, TIFF_CACHE.nodata) : null;
+  const scale   = DETECTED_SCALE[activeLayer];
+
+  const isDead = curRaw !== null && curRaw.count === 0;
+  const isSaturated = !isDead && curRaw !== null &&
+    curRaw.count > 0 &&
+    Math.abs(curRaw.max - curRaw.min) < 0.003 &&
+    curRaw.count > 50;
+
+  const classifyRow = (s: ReturnType<typeof fullBandStats> | null): "dead" | "saturated" | "ok" | "missing" => {
+    if (!s) return "missing";
+    if (s.count === 0) return "dead";
+    if (Math.abs(s.max - s.min) < 0.003 && s.count > 50) return "saturated";
+    return "ok";
+  };
+
+  const diagKey = `${activeLayer}:26`;
+  const diag    = BAND_DIAGNOSTICS.get(diagKey);
+
+  const showSoilBanner = activeLayer === "soil" && SOIL_DATA_UNRELIABLE;
+
+  return (
+    <Card style={{ padding: "14px 16px", border: "1px solid #fcd34d", background: "#fffbeb" }}>
+      <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>
+        <span style={{ fontSize:13 }}>🔬</span>
+        <p style={{ ...sectionLabel, marginBottom:0, color:"#92400e" }}>Band Diagnostics · {LAYER_META[activeLayer].name}</p>
+      </div>
+
+      {showSoilBanner && (
+        <div style={{ marginBottom:10, padding:"10px 12px", background:"#fef2f2", border:"2px solid #ef4444", borderRadius:8 }}>
+          <div style={{ fontSize:11, fontWeight:800, color:"#991b1b", marginBottom:4 }}>
+            ⛔ SOIL DATA UNRELIABLE — SOURCE TIFF CORRUPTED
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", gap:3, marginBottom:6 }}>
+            <span style={{ fontSize:9.5, color:"#7f1d1d" }}>• Some weeks: all pixels ≈ 1.0 (GEE .min(1) saturation)</span>
+            <span style={{ fontSize:9.5, color:"#7f1d1d" }}>• Some weeks: all pixels = 0 (dead band / masked region)</span>
+            <span style={{ fontSize:9.5, color:"#7f1d1d" }}>• Temporal pattern is inconsistent → data cannot be corrected</span>
+          </div>
+          <div style={{ padding:"6px 9px", background:"#fff7ed", borderRadius:6, border:"1px solid #fed7aa" }}>
+            <div style={{ fontSize:9, fontWeight:700, color:"#9a3412", marginBottom:3 }}>Required GEE Re-export Fix:</div>
+            <div style={{ fontSize:8.5, color:"#7c2d12", fontFamily:"monospace", lineHeight:1.7, whiteSpace:"pre-wrap" }}>
+              {`// 1. Check actual raw range:\nsoil_img.reduceRegion(\n  ee.Reducer.minMax(), NAGPUR, 5000\n).evaluate(print)\n\n// 2. Use correct divisor (e.g. if max≈4000):\nsoil_normalized = soil_img.divide(4000)\n  .max(0).min(1)\n\n// 3. Ensure no temporal masking:\n.unmask(0).clip(NAGPUR)`}
+            </div>
+          </div>
+          <div style={{ marginTop:5, fontSize:9, color:"#991b1b", fontWeight:600 }}>
+            Frontend displays raw values honestly. No interpolation or correction applied.
+          </div>
+        </div>
+      )}
+
+      {curRaw && (
+        <div style={{ marginBottom:10, padding:"8px 10px", background:"#fff", borderRadius:8, border:"1px solid #fde68a" }}>
+          <div style={{ fontSize:9.5, fontWeight:700, color:"#78350f", textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:6 }}>
+            Current Week {weekIndex+1} · Band {curBi}
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:4 }}>
+            {[
+              { label:"RAW min",  val: curRaw.min.toFixed(4),   color:"#3b82f6" },
+              { label:"RAW max",  val: curRaw.max.toFixed(4),   color:"#ef4444" },
+              { label:"RAW avg",  val: curRaw.avg !== null ? curRaw.avg.toFixed(4) : "—", color:"#374151" },
+              { label:"×scale",   val: `×${scale}`,              color:"#7c3aed" },
+              { label:"DISP min", val: (curRaw.min * scale).toFixed(4), color:"#3b82f6" },
+              { label:"DISP max", val: (curRaw.max * scale).toFixed(4), color:"#ef4444" },
+            ].map(r => (
+              <div key={r.label} style={{ background:"#f9fafb", borderRadius:5, padding:"4px 6px" }}>
+                <div style={{ fontSize:7.5, color:"#9ca3af", fontWeight:700, textTransform:"uppercase" }}>{r.label}</div>
+                <div style={{ fontSize:11, fontWeight:800, color:r.color, fontFamily:"monospace" }}>{r.val}</div>
+              </div>
+            ))}
+          </div>
+          {isDead && (
+            <div style={{ marginTop:6, padding:"5px 8px", background:"#f1f5f9", border:"1px solid #94a3b8", borderRadius:6 }}>
+              <span style={{ fontSize:9.5, color:"#1e3a5f", fontWeight:700 }}>
+                ⬛ DEAD BAND: zero valid pixels this week.
+              </span>
+            </div>
+          )}
+          {isSaturated && !isDead && (
+            <div style={{ marginTop:6, padding:"5px 8px", background:"#fef2f2", border:"1px solid #fca5a5", borderRadius:6 }}>
+              <span style={{ fontSize:9.5, color:"#991b1b", fontWeight:700 }}>
+                ⚠️ SATURATED: all pixels ≈ same value.
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ fontSize:9.5, fontWeight:700, color:"#78350f", textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:5 }}>
+        Raw TIFF Values · 4 Probe Weeks
+      </div>
+      <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
+        <div style={{ display:"grid", gridTemplateColumns:"40px 40px 40px 1fr 1fr 1fr", gap:4, padding:"3px 6px" }}>
+          {["wk","band","state","min","max","avg"].map(h => (
+            <span key={h} style={{ fontSize:8, color:"#9ca3af", fontWeight:700, textTransform:"uppercase" }}>{h}</span>
+          ))}
+        </div>
+        {rows.map(({ wi, bi, s }) => {
+          const state = classifyRow(s);
+          const stateBg = state === "dead" ? "#f1f5f9" : state === "saturated" ? "#fef2f2" : "#fff";
+          const stateBorder = state === "dead" ? "1px solid #94a3b8" : state === "saturated" ? "1px solid #fca5a5" : "1px solid #f1f5f9";
+          const stateLabel = state === "dead" ? "⬛dead" : state === "saturated" ? "⚠️sat" : state === "missing" ? "❌miss" : "✓ok";
+          const stateColor = state === "dead" ? "#475569" : state === "saturated" ? "#991b1b" : state === "missing" ? "#dc2626" : "#15803d";
+          return (
+            <div key={wi} style={{
+              display:"grid", gridTemplateColumns:"40px 40px 40px 1fr 1fr 1fr", gap:4,
+              padding:"4px 6px", borderRadius:6,
+              background: wi === weekIndex ? "#fef3c7" : stateBg,
+              border: wi === weekIndex ? "1px solid #fbbf24" : stateBorder,
+            }}>
+              <span style={{ fontSize:9, color:"#374151", fontFamily:"monospace" }}>W{wi+1}</span>
+              <span style={{ fontSize:9, color:"#7c3aed", fontFamily:"monospace" }}>b{bi}</span>
+              <span style={{ fontSize:8, color:stateColor, fontWeight:700 }}>{stateLabel}</span>
+              {s && s.count > 0 ? (
+                <>
+                  <span style={{ fontSize:9, color:"#3b82f6", fontFamily:"monospace" }}>{s.min.toFixed(3)}</span>
+                  <span style={{ fontSize:9, color:"#ef4444", fontFamily:"monospace" }}>{s.max.toFixed(3)}</span>
+                  <span style={{ fontSize:9, color:"#374151", fontFamily:"monospace" }}>{s.avg !== null ? s.avg.toFixed(3) : "—"}</span>
+                </>
+              ) : (
+                <span style={{ fontSize:9, color:"#ef4444", gridColumn:"4/7" }}>{s ? "no valid pixels" : "out of range"}</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {diag?.warning && !showSoilBanner && (
+        <div style={{ marginTop:8, padding:"7px 9px", background:"#fef2f2", border:"1px solid #fca5a5", borderRadius:7 }}>
+          <div style={{ fontSize:9, fontWeight:700, color:"#991b1b", marginBottom:3 }}>⚠️ GEE Export Issue Detected</div>
+          <div style={{ fontSize:9, color:"#7f1d1d", lineHeight:1.5 }}>{diag.warning}</div>
+        </div>
+      )}
+
+      <div style={{ marginTop:7, fontSize:8, color:"#b45309" }}>
+        Scale factor: ×{scale} applied to raw TIFF values.
+      </div>
+    </Card>
+  );
+}
 
 function AnalyticsContent({ stats, activeLayer, weekIndex, year, annualMeans }: {
-  stats: RealStats | null; activeLayer: LayerType; weekIndex: number; year: number; annualMeans: AnnualMeans | null;
+  stats: RealStats; activeLayer: LayerType; weekIndex: number; year: number; annualMeans: AnnualMeans;
 }) {
-  const donutData = useMemo(() => {
-    if (!stats) return null;
-    return [
-      { name: "Hot",      value: Math.round(stats.hotPct  * 10) / 10, color: "#ef4444" },
-      { name: "Moderate", value: Math.round(stats.modPct  * 10) / 10, color: "#facc15" },
-      { name: "Cool",     value: Math.round(stats.coolPct * 10) / 10, color: "#3b82f6" },
-    ];
-  }, [stats]);
+  const isLoading = !stats.tiffDerived;
 
-  const meta = LAYER_META[activeLayer];
+  const donutData = useMemo(() => [
+    { name: "Hot",      value: Math.round(stats.hotPct  * 10) / 10, color: "#ef4444" },
+    { name: "Moderate", value: Math.round(stats.modPct  * 10) / 10, color: "#facc15" },
+    { name: "Cool",     value: Math.round(stats.coolPct * 10) / 10, color: "#3b82f6" },
+  ], [stats]);
 
-  if (!stats) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        {[0,1,2].map(i => (
-          <Card key={i} style={{ padding: "14px 16px", background: "#f8fafc" }}>
-            <div style={{ height: 10, background: "#e5e7eb", borderRadius: 6, marginBottom: 8, width: "55%" }} />
-            <div style={{ height: 26, background: "#e5e7eb", borderRadius: 6, width: "38%" }} />
-          </Card>
-        ))}
-        <p style={{ fontSize: 11, color: "#9ca3af", textAlign: "center", marginTop: 4 }}>Loading data…</p>
-        <DataSourcesPanel />
-      </div>
-    );
-  }
+  const meta        = LAYER_META[activeLayer];
+  const accentColor = LAYER_INFO[activeLayer].accentColor;
+  const bgColor     = LAYER_INFO[activeLayer].bgColor;
 
-  const d1 = dateFromWeek(year, weekIndex);
-  const d2 = dateEndFromWeek(year, weekIndex);
+  const d1      = dateFromWeek(year, weekIndex);
+  const d2      = dateEndFromWeek(year, weekIndex);
   const dateStr = `${formatDateShort(d1)} – ${formatDateShort(d2)} ${year}`;
 
   const fmtVal = (v: number): string => {
@@ -576,30 +1613,42 @@ function AnalyticsContent({ stats, activeLayer, weekIndex, year, annualMeans }: 
       case "lst":   return `${v.toFixed(1)}°C`;
       case "ndvi":  return v.toFixed(3);
       case "rain":  return `${v.toFixed(1)} mm`;
-      case "soil":  return `${(v * 100).toFixed(1)}%`;
-      case "water": return `${v.toFixed(1)}%`;
+      case "soil":  return `${v.toFixed(4)} (${(v * 100).toFixed(1)}%)`;
+      case "water": return `${v.toFixed(2)}%`;
       case "lulc":  return `cls ${Math.round(v)}`;
-      default:      return v.toFixed(2);
+      default:      return v.toFixed(4);
     }
   };
-
-  const accentColor = LAYER_INFO[activeLayer].accentColor;
-  const bgColor     = LAYER_INFO[activeLayer].bgColor;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <Card style={{ padding: "12px 14px", background: bgColor, border: `1px solid ${accentColor}33` }}>
-        <p style={{ ...sectionLabel, color: accentColor, marginBottom: 8 }}>{meta.emoji} {meta.name} · Active Layer</p>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: 8 }}>
+          <p style={{ ...sectionLabel, color: accentColor, marginBottom: 0 }}>{meta.emoji} {meta.name} · Active Layer</p>
+          {activeLayer === "soil" && SOIL_DATA_UNRELIABLE
+            ? <span style={{ fontSize:8, background:"#fef2f2", color:"#991b1b", borderRadius:4, padding:"1px 5px", fontWeight:700, border:"1px solid #fca5a5" }}>⚠️ UNRELIABLE</span>
+            : isLoading
+              ? <span style={{ fontSize:8, background:"#fef9c3", color:"#92400e", borderRadius:4, padding:"1px 5px", fontWeight:700 }}>TIFF Loading…</span>
+              : <span style={{ fontSize:8, background:"#dcfce7", color:"#15803d", borderRadius:4, padding:"1px 5px", fontWeight:700 }}>COG TIFF ✓</span>
+          }
+        </div>
+        {activeLayer === "soil" && SOIL_DATA_UNRELIABLE && (
+          <div style={{ marginBottom:8, padding:"6px 10px", background:"#fef2f2", border:"1px solid #fca5a5", borderRadius:7 }}>
+            <span style={{ fontSize:9.5, color:"#7f1d1d", fontWeight:700 }}>
+              Source TIFF temporally corrupt.
+            </span>
+          </div>
+        )}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
           {[
-            { label: "Average", value: fmtVal(stats.avg), accent: accentColor },
-            { label: "Pixels",  value: stats.count.toLocaleString(), accent: "#6b7280" },
-            { label: "Min",     value: fmtVal(stats.min), accent: "#3b82f6" },
-            { label: "Max",     value: fmtVal(stats.max), accent: "#dc2626" },
+            { label: "Average", value: isLoading ? "—" : fmtVal(stats.avg), accent: accentColor },
+            { label: "Pixels",  value: isLoading ? "—" : stats.count.toLocaleString(), accent: "#6b7280" },
+            { label: "Min",     value: isLoading ? "—" : fmtVal(stats.min), accent: "#3b82f6" },
+            { label: "Max",     value: isLoading ? "—" : fmtVal(stats.max), accent: "#dc2626" },
           ].map(r => (
             <div key={r.label} style={{ background: "#fff", borderRadius: 9, padding: "8px 10px", border: "1px solid #f1f5f9" }}>
               <div style={{ fontSize: 9, color: "#9ca3af", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>{r.label}</div>
-              <div style={{ fontSize: 14, fontWeight: 800, color: r.accent, fontFamily: "monospace" }}>{r.value}</div>
+              <div style={{ fontSize: 14, fontWeight: 800, color: isLoading ? "#d1d5db" : r.accent, fontFamily: "monospace" }}>{r.value}</div>
             </div>
           ))}
         </div>
@@ -613,71 +1662,23 @@ function AnalyticsContent({ stats, activeLayer, weekIndex, year, annualMeans }: 
             { label: "Moderate",  value: `${stats.modPct.toFixed(1)}%`,  accent: "#ca8a04", bg: "#fefce8", icon: Activity    },
             { label: "Cool",      value: `${stats.coolPct.toFixed(1)}%`, accent: "#3b82f6", bg: "#eff6ff", icon: Activity    },
           ]} />
-          <SummaryGrid items={[
-            { label: "Min Temp", value: `${stats.min.toFixed(1)}°C`, accent: "#3b82f6", bg: "#eff6ff", icon: Thermometer },
-            { label: "Max Temp", value: `${stats.max.toFixed(1)}°C`, accent: "#dc2626", bg: "#fef2f2", icon: Thermometer },
-          ]} />
         </>
       )}
 
-      {activeLayer === "lst" && donutData && (
-        <Card style={{ padding: "14px 16px" }}>
-          <p style={sectionLabel}>Temperature Distribution</p>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ width: 96, height: 96, flexShrink: 0 }}>
-              <svg viewBox="0 0 96 96" width={96} height={96}>
-                {(() => {
-                  const total = donutData.reduce((s, d) => s + d.value, 0) || 100;
-                  let cursor = -90;
-                  const cx = 48, cy = 48, r = 38, ir = 22;
-                  return donutData.map((d, idx) => {
-                    const angle    = (d.value / total) * 360;
-                    const sRad     = (cursor * Math.PI) / 180;
-                    const eRad     = ((cursor + angle) * Math.PI) / 180;
-                    const x1 = cx + r  * Math.cos(sRad), y1 = cy + r  * Math.sin(sRad);
-                    const x2 = cx + r  * Math.cos(eRad), y2 = cy + r  * Math.sin(eRad);
-                    const ix1= cx + ir * Math.cos(sRad), iy1= cy + ir * Math.sin(sRad);
-                    const ix2= cx + ir * Math.cos(eRad), iy2= cy + ir * Math.sin(eRad);
-                    const large = angle > 180 ? 1 : 0;
-                    const path  = `M${x1} ${y1} A${r} ${r} 0 ${large} 1 ${x2} ${y2} L${ix2} ${iy2} A${ir} ${ir} 0 ${large} 0 ${ix1} ${iy1}Z`;
-                    cursor += angle;
-                    return <path key={idx} d={path} fill={d.color} />;
-                  });
-                })()}
-              </svg>
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-              {donutData.map(d => (
-                <div key={d.name} style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: d.color, flexShrink: 0, display: "inline-block" }} />
-                  <span style={{ fontSize: 11, color: "#475569" }}>{d.name}</span>
-                  <span style={{ fontSize: 11, color: "#9ca3af", marginLeft: "auto", paddingLeft: 8 }}>{d.value.toFixed(1)}%</span>
-                </div>
-              ))}
-              <div style={{ marginTop: 4, padding: "5px 7px", background: "#fff7ed", borderRadius: 6, border: "1px solid #fed7aa" }}>
-                <span style={{ fontSize: 9, color: "#92400e", lineHeight: 1.5, display: "block" }}>
-                  Hot = LST &gt; avg+5°C<br />Cool = LST &lt; avg−5°C<br />Moderate = within ±5°C
-                </span>
-              </div>
-            </div>
-          </div>
-        </Card>
-      )}
-
-      <Card style={{ padding: "12px 14px" }}>
+      <Card style={{ padding: "14px 16px" }}>
         <p style={sectionLabel}>Data Info · Week {weekIndex + 1}/52</p>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {[
-            { label: "Period",      value: dateStr },
-            { label: "Valid Pixels",value: stats.count.toLocaleString() },
-            { label: "Min",         value: fmtVal(stats.min) },
-            { label: "Max",         value: fmtVal(stats.max) },
-            { label: "Average",     value: fmtVal(stats.avg) },
-            { label: "Band idx",    value: `${getBandIdx(weekIndex, activeLayer)} (0-based)` },
+            { label: "Period",   value: dateStr },
+            { label: "Pixels",   value: isLoading ? "Loading…" : stats.count.toLocaleString() },
+            { label: "Min",      value: isLoading ? "—" : fmtVal(stats.min) },
+            { label: "Max",      value: isLoading ? "—" : fmtVal(stats.max) },
+            { label: "Average",  value: isLoading ? "—" : fmtVal(stats.avg) },
+            { label: "Source",   value: isLoading ? "COG TIFF loading…" : "COG TIFF · Real Pixels" },
           ].map(r => (
             <div key={r.label} style={{ display: "flex", justifyContent: "space-between" }}>
               <span style={{ fontSize: 10.5, color: "#6b7280" }}>{r.label}</span>
-              <span style={{ fontSize: 10.5, color: "#111827", fontWeight: 600, fontFamily: "monospace" }}>{r.value}</span>
+              <span style={{ fontSize: 10.5, color: isLoading && r.label !== "Period" ? "#d1d5db" : "#111827", fontWeight: 600, fontFamily: "monospace" }}>{r.value}</span>
             </div>
           ))}
         </div>
@@ -686,19 +1687,19 @@ function AnalyticsContent({ stats, activeLayer, weekIndex, year, annualMeans }: 
       <Card style={{ padding: "14px 16px" }}>
         <p style={sectionLabel}>Layer Overview</p>
         {[
-          { label: "NDVI",        pct: annualMeans ? Math.round(Math.max(0, Math.min(100, (annualMeans.ndvi / 0.85) * 100))) : 52, color: "#22c55e", explain: annualMeans ? `Annual avg NDVI ${annualMeans.ndvi.toFixed(3)}` : "~52% area has NDVI > 0.3" },
-          { label: "LST Hot",     pct: Math.min(100, Math.round(stats.hotPct + stats.modPct)), color: "#f97316", explain: `${Math.min(100, Math.round(stats.hotPct + stats.modPct))}% area is moderate-to-hot` },
-          { label: "Rainfall",    pct: annualMeans ? Math.round(Math.max(0, Math.min(100, (annualMeans.rain / 80) * 100))) : 44, color: "#38bdf8", explain: annualMeans ? `Annual avg rain ${annualMeans.rain.toFixed(1)} mm/week` : "" },
-          { label: "Soil Moist.", pct: annualMeans ? Math.round(Math.max(0, Math.min(100, annualMeans.soil * 100))) : 38, color: "#84cc16", explain: annualMeans ? `Annual avg soil ${(annualMeans.soil * 100).toFixed(1)}%` : "" },
-          { label: "Water Cover", pct: annualMeans ? Math.round(Math.max(0, Math.min(100, annualMeans.water))) : 12, color: "#06b6d4", explain: annualMeans ? `Annual avg water ${annualMeans.water.toFixed(1)}%` : "" },
+          { label: "NDVI",        pct: annualMeans.ndvi > 0 ? Math.round(Math.max(0, Math.min(100, (annualMeans.ndvi / 0.85) * 100))) : null, color: "#22c55e", explain: annualMeans.ndvi > 0 ? `Annual avg NDVI ${annualMeans.ndvi.toFixed(3)}` : "TIFF loading…" },
+          { label: "LST Hot",     pct: stats.tiffDerived ? Math.min(100, Math.round(stats.hotPct + stats.modPct)) : null, color: "#f97316", explain: stats.tiffDerived ? `${Math.min(100, Math.round(stats.hotPct + stats.modPct))}% area is moderate-to-hot` : "TIFF loading…" },
+          { label: "Rainfall",    pct: annualMeans.rain > 0 ? Math.round(Math.max(0, Math.min(100, (annualMeans.rain / 80) * 100))) : null,  color: "#38bdf8", explain: annualMeans.rain > 0 ? `Annual avg rain ${annualMeans.rain.toFixed(1)} mm/week` : "TIFF loading…" },
+          { label: "Soil Moist.", pct: annualMeans.soil > 0 ? Math.round(Math.max(0, Math.min(100, annualMeans.soil * 100))) : null,         color: "#84cc16", explain: annualMeans.soil > 0 ? `Annual avg soil ${(annualMeans.soil * 100).toFixed(1)}%` : "TIFF loading…" },
+          { label: "Water Cover", pct: annualMeans.water > 0 ? Math.round(Math.max(0, Math.min(100, annualMeans.water))) : null,              color: "#06b6d4", explain: annualMeans.water > 0 ? `Annual avg water ${annualMeans.water.toFixed(1)}%` : "TIFF loading…" },
         ].map(r => (
           <div key={r.label} style={{ marginBottom: 11 }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
               <span style={{ fontSize: 11, color: "#475569", fontWeight: 600 }}>{r.label}</span>
-              <span style={{ fontSize: 11, fontWeight: 700, color: "#111827" }}>{r.pct}%</span>
+              <span style={{ fontSize: 11, fontWeight: 700, color: r.pct !== null ? "#111827" : "#d1d5db" }}>{r.pct !== null ? `${r.pct}%` : "—"}</span>
             </div>
             <div style={{ height: 5, background: "#f1f5f9", borderRadius: 99, overflow: "hidden", marginBottom: 4 }}>
-              <div style={{ height: "100%", width: `${r.pct}%`, background: r.color, borderRadius: 99, transition: "width 0.6s" }} />
+              <div style={{ height: "100%", width: r.pct !== null ? `${r.pct}%` : "0%", background: r.color, borderRadius: 99, transition: "width 0.6s" }} />
             </div>
             <div style={{ fontSize: 9.5, color: "#9ca3af", lineHeight: 1.4 }}>{r.explain}</div>
           </div>
@@ -706,21 +1707,71 @@ function AnalyticsContent({ stats, activeLayer, weekIndex, year, annualMeans }: 
       </Card>
 
       <AnnualMeansPanel means={annualMeans} year={year} />
-      <DataSourcesPanel />
+      <BandDiagnosticsPanel activeLayer={activeLayer} weekIndex={weekIndex} />
+      <DataSourcesPanel year={year} />
     </div>
   );
 }
 
-// ─── Basemap Tiles ─────────────────────────────────────────────────────────────
+// ─── Basemap Tiles ────────────────────────────────────────────────────────────
 
 function BasemapTiles({ mapType }: { mapType: MapType }) {
-  if (mapType === "osm") return <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />;
-  if (mapType === "satellite") return <TileLayer url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" maxZoom={22} attribution="© Esri" />;
-  return <>
-    <TileLayer url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" maxZoom={22} attribution="© Esri" />
-    <TileLayer url="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}" maxZoom={22} opacity={0.9} />
-  </>;
+  const labelsLayer = (
+    <TileLayer
+      key="city-labels"
+      url="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
+      maxZoom={22}
+      opacity={0.95}
+      zIndex={450}
+    />
+  );
+  if (mapType === "osm") {
+    return (
+      <>
+        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
+        {labelsLayer}
+      </>
+    );
+  }
+  if (mapType === "satellite") {
+    return (
+      <>
+        <TileLayer url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" maxZoom={22} attribution="© Esri" />
+        {labelsLayer}
+      </>
+    );
+  }
+  return (
+    <>
+      <TileLayer url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" maxZoom={22} attribution="© Esri" />
+      {labelsLayer}
+    </>
+  );
 }
+
+// ─── XYZ Raster Tile Layer ────────────────────────────────────────────────────
+
+const RasterTileLayer = React.memo(({ year }: { year: number }) => {
+  const tileUrl = getTileUrl(year);
+  if (!tileUrl) return null;
+  return (
+    <TileLayer
+      key={`raster-${year}`}
+      url={tileUrl}
+      attribution="Nagpur Raster Tiles"
+      opacity={0.8}
+      minZoom={5}
+      maxZoom={12}
+      tileSize={256}
+      updateWhenZooming={false}
+      updateWhenIdle={true}
+      keepBuffer={6}
+      crossOrigin={true}
+      zIndex={250}
+      className="nagpur-tiles"
+    />
+  );
+});
 
 // ─── Map Controls ─────────────────────────────────────────────────────────────
 
@@ -730,7 +1781,8 @@ function MapControls({ mapType, setMapType }: { mapType: MapType; setMapType: (m
     <div style={{ position: "absolute", top: 16, right: 16, zIndex: 700, display: "flex", flexDirection: "column", gap: 8 }}>
       <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderRadius: 12, boxShadow: "0 4px 16px rgba(0,0,0,0.09)", overflow: "hidden" }}>
         {[{ label: "+", fn: () => map.zoomIn() }, { label: "−", fn: () => map.zoomOut() }].map(({ label, fn }) => (
-          <button key={label} onClick={fn} style={{ display: "block", width: 36, height: 36, border: "none", background: "transparent", fontSize: 18, cursor: "pointer", color: "#374151", lineHeight: 1, borderBottom: label === "+" ? "1px solid #f1f5f9" : "none" }}
+          <button key={label} onClick={fn}
+            style={{ display: "block", width: 36, height: 36, border: "none", background: "transparent", fontSize: 18, cursor: "pointer", color: "#374151", lineHeight: 1, borderBottom: label === "+" ? "1px solid #f1f5f9" : "none" }}
             onMouseEnter={e => (e.currentTarget.style.background = "#f8fafc")}
             onMouseLeave={e => (e.currentTarget.style.background = "transparent")}>{label}</button>
         ))}
@@ -752,101 +1804,36 @@ function MapControls({ mapType, setMapType }: { mapType: MapType; setMapType: (m
   );
 }
 
-// ─── Canvas Layer ─────────────────────────────────────────────────────────────
-
-const CanvasLayer = React.memo(({ band, width, height, bbox, minVal, maxVal, layerType }: {
-  band: any; width: number; height: number; bbox: number[];
-  minVal: number; maxVal: number; layerType: LayerType;
-}) => {
-  const map = useMap();
-  const overlayRef = useRef<L.ImageOverlay | null>(null);
-
-  useEffect(() => {
-    if (!band || !width || !height || !bbox.length) return;
-
-    const canvas = document.createElement("canvas");
-    canvas.width = width; canvas.height = height;
-    const ctx    = canvas.getContext("2d")!;
-    const imgData = ctx.createImageData(width, height);
-    const px = imgData.data;
-    for (let i = 0; i < width * height; i++) {
-      const v = band[i] as number;
-      if (v == null || isNaN(v) || v <= NODATA + 1) { px[i*4+3] = 0; continue; }
-      const [r, g, b] = getColor(v, layerType, minVal, maxVal);
-      px[i*4]=r; px[i*4+1]=g; px[i*4+2]=b; px[i*4+3]=172;
-    }
-    ctx.putImageData(imgData, 0, 0);
-
-    const bounds: L.LatLngBoundsExpression = [[bbox[1], bbox[0]], [bbox[3], bbox[2]]];
-    const dataUrl = canvas.toDataURL();
-
-    // Reuse overlay if it already exists on map, just update url
-    if (overlayRef.current) {
-      map.removeLayer(overlayRef.current);
-    }
-    const ov = L.imageOverlay(dataUrl, bounds, { opacity: 1, zIndex: 250 });
-    ov.addTo(map);
-    overlayRef.current = ov;
-
-    return () => {
-      if (overlayRef.current) {
-        map.removeLayer(overlayRef.current);
-        overlayRef.current = null;
-      }
-    };
-  }, [band, width, height, bbox, minVal, maxVal, layerType, map]);
-
-  return null;
-});
-
 // ─── GeoJSON Boundary Layer ───────────────────────────────────────────────────
 
 const NagpurBoundaryLayer = React.memo(() => {
-  const map = useMap();
+  const map      = useMap();
   const layerRef = useRef<L.GeoJSON | null>(null);
 
   useEffect(() => {
-    // Fetch real boundary geojson; fall back to bbox polygon if unavailable
     let cancelled = false;
 
     const addFallback = () => {
       if (cancelled || layerRef.current) return;
-      const NAGPUR_BBOX = [78.65, 20.70, 79.70, 21.58];
+      const bbox = [78.65, 20.70, 79.70, 21.58];
       const coords: L.LatLngTuple[] = [
-        [NAGPUR_BBOX[1], NAGPUR_BBOX[0]],
-        [NAGPUR_BBOX[1], NAGPUR_BBOX[2]],
-        [NAGPUR_BBOX[3], NAGPUR_BBOX[2]],
-        [NAGPUR_BBOX[3], NAGPUR_BBOX[0]],
-        [NAGPUR_BBOX[1], NAGPUR_BBOX[0]],
+        [bbox[1], bbox[0]], [bbox[1], bbox[2]],
+        [bbox[3], bbox[2]], [bbox[3], bbox[0]], [bbox[1], bbox[0]],
       ];
-      const polygon = L.polygon(coords, {
-        color: "#38bdf8",
-        weight: 2,
-        fillOpacity: 0,
-        dashArray: "6 4",
-        opacity: 0.85,
-      });
-      polygon.addTo(map);
-      layerRef.current = polygon as unknown as L.GeoJSON;
+      const poly = L.polygon(coords, { color: "#38bdf8", weight: 2, fillOpacity: 0, dashArray: "6 4", opacity: 0.85 });
+      poly.addTo(map);
+      layerRef.current = poly as unknown as L.GeoJSON;
     };
 
     fetch("/nagpur_boundary.geojson")
       .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
       .then(geojson => {
         if (cancelled) return;
-        const layer = L.geoJSON(geojson, {
-          style: {
-            color: "#38bdf8",
-            weight: 2.5,
-            fillOpacity: 0,
-            opacity: 0.9,
-            dashArray: undefined,
-          },
-        });
+        const layer = L.geoJSON(geojson, { style: { color: "#38bdf8", weight: 2.5, fillOpacity: 0, opacity: 0.9 } });
         layer.addTo(map);
         layerRef.current = layer;
       })
-      .catch(() => { addFallback(); });
+      .catch(() => addFallback());
 
     return () => {
       cancelled = true;
@@ -857,20 +1844,49 @@ const NagpurBoundaryLayer = React.memo(() => {
   return null;
 });
 
-// ─── Hover Tooltip (compact, optimized) ──────────────────────────────────────
-// LST layer  → multi-layer two-column tooltip (all 6 bands)
-// All others → single-layer lightweight tooltip (active band only)
+// ─── Hover Tooltip — COG TIFF values only ────────────────────────────────────
 
 const TOOLTIP_STYLE = `<style>.nagpur-tooltip .leaflet-popup-content-wrapper{border-radius:10px!important;box-shadow:0 4px 16px rgba(0,0,0,0.14)!important;padding:0!important;border:1px solid #e5e7eb;overflow:hidden}.nagpur-tooltip .leaflet-popup-content{margin:0!important;width:auto!important}.nagpur-tooltip .leaflet-popup-tip-container{display:none}</style>`;
 
-const HoverTooltip = React.memo(({ currentWeekBands, width, height, bbox, weekIndex, year, annualMeans, activeLayer }: {
-  currentWeekBands: any[] | null; width: number; height: number; bbox: number[];
-  weekIndex: number; year: number; annualMeans: AnnualMeans | null; activeLayer: LayerType;
+const GLOBAL_CSS = `
+.nagpur-tiles img {
+  image-rendering: auto !important;
+  filter: contrast(1.08) saturate(1.12) brightness(0.95);
+  transform: scale(1.01);
+}
+.leaflet-image-layer.nagpur-heat-overlay {
+  mix-blend-mode: normal;
+  image-rendering: pixelated;
+}
+`;
+if (typeof document !== "undefined") {
+  const styleId = "nagpur-global-css";
+  if (!document.getElementById(styleId)) {
+    const el = document.createElement("style");
+    el.id = styleId;
+    el.textContent = GLOBAL_CSS;
+    document.head.appendChild(el);
+  }
+}
+
+function getTooltipValue(layer: LayerType, weekIndex: number, lat: number, lng: number): number | null {
+  return sampleTiffValue(layer, weekIndex, lat, lng);
+}
+
+function isTiffLive(): boolean {
+  return TIFF_CACHE !== null;
+}
+
+const HoverTooltip = React.memo(({ weekIndex, year, annualMeans, activeLayer }: {
+  weekIndex: number; year: number; annualMeans: AnnualMeans; activeLayer: LayerType;
 }) => {
-  const popupRef   = useRef<L.Popup | null>(null);
-  const isDragging = useRef(false);
-  const lastPxRef  = useRef<{ x: number; y: number } | null>(null);
-  const map = useMap();
+  const popupRef     = useRef<L.Popup | null>(null);
+  const isDragging   = useRef(false);
+  const rafRef       = useRef<number | null>(null);
+  const lastLatLng   = useRef<[number, number] | null>(null);
+  const map          = useMap();
+
+  useEffect(() => { prewarmTiffs(year); }, [year]);
 
   useEffect(() => {
     const onStart = () => {
@@ -879,43 +1895,67 @@ const HoverTooltip = React.memo(({ currentWeekBands, width, height, bbox, weekIn
     };
     const onEnd = () => { isDragging.current = false; };
     map.on("dragstart", onStart);
-    map.on("dragend", onEnd);
+    map.on("dragend",   onEnd);
     return () => { map.off("dragstart", onStart); map.off("dragend", onEnd); };
   }, [map]);
 
   useMapEvents({
     mousemove(e) {
-      if (isDragging.current || !currentWeekBands || !width || !height || !bbox.length) return;
+      if (isDragging.current) return;
+
       const { lat, lng } = e.latlng;
-      if (lng < bbox[0] || lng > bbox[2] || lat < bbox[1] || lat > bbox[3]) {
+      // Use actual TIFF bbox so tooltip works across the full rendered canvas area.
+      // Fallback to NAGPUR_BBOX if TIFF not yet loaded.
+      const [bMinX, bMinY, bMaxX, bMaxY] = TIFF_CACHE
+        ? TIFF_CACHE.bbox
+        : [NAGPUR_BBOX.minLng, NAGPUR_BBOX.minLat, NAGPUR_BBOX.maxLng, NAGPUR_BBOX.maxLat];
+      if (lng < bMinX || lng > bMaxX || lat < bMinY || lat > bMaxY) {
         try { if (popupRef.current) map.closePopup(popupRef.current); } catch (_) {}
-        lastPxRef.current = null;
+        lastLatLng.current = null;
         return;
       }
 
-      const x = Math.max(0, Math.min(width  - 1, Math.floor(((lng - bbox[0]) / (bbox[2] - bbox[0])) * width)));
-      const y = Math.max(0, Math.min(height - 1, Math.floor(((bbox[3] - lat) / (bbox[3] - bbox[1])) * height)));
+      if (rafRef.current !== null) return;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        buildTooltip(lat, lng);
+      });
+    },
 
-      // Skip if same pixel — avoids unnecessary DOM updates
-      if (lastPxRef.current && lastPxRef.current.x === x && lastPxRef.current.y === y) return;
-      lastPxRef.current = { x, y };
+    mouseout() {
+      if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+      try { if (popupRef.current) map.closePopup(popupRef.current); } catch (_) {}
+      lastLatLng.current = null;
+    },
+  });
 
-      // Read one band value at pixel (x, y)
-      const readPx = (layer: LayerType): number | null => {
-        const band = currentWeekBands[BAND_OFFSET[layer]];
-        if (!band) return null;
-        const idx = y * width + x;
-        if (idx < 0 || idx >= band.length) return null;
-        const v = band[idx];
-        return (v == null || !Number.isFinite(v) || Number.isNaN(v) || v <= NODATA + 1) ? null : v as number;
-      };
+  function buildTooltip(lat: number, lng: number) {
+    if (!popupRef.current) {
+      popupRef.current = L.popup({
+        closeButton: false, offset: [0, -4], maxWidth: 260,
+        className: "nagpur-tooltip", autoPan: false,
+      });
+    }
 
-      const d1 = dateFromWeek(year, weekIndex);
-      const d2 = dateEndFromWeek(year, weekIndex);
-      const weekStr = `${formatDateShort(d1)}–${formatDateShort(d2)}`;
+    const d1      = dateFromWeek(year, weekIndex);
+    const d2      = dateEndFromWeek(year, weekIndex);
+    const weekStr = `${formatDateShort(d1)}–${formatDateShort(d2)}`;
+    const am      = annualMeans;
 
-      // Shared header HTML
-      const header = `
+    const srcBadge = (_layer: LayerType) =>
+      isTiffLive()
+        ? `<span style="font-size:7px;background:#dcfce7;color:#15803d;border-radius:3px;padding:1px 4px;font-weight:700;vertical-align:middle">COG</span>`
+        : `<span style="font-size:7px;background:#fef9c3;color:#92400e;border-radius:3px;padding:1px 4px;font-weight:700;vertical-align:middle">Loading…</span>`;
+
+    const delta = (val: number, annual: number): string => {
+      const d   = val - annual;
+      const col = d > 0 ? "#ef4444" : "#22c55e";
+      const abs = Math.abs(d);
+      const str = abs < 0.001 ? "0.0" : abs < 1 ? abs.toFixed(3) : abs.toFixed(1);
+      return ` <span style="color:${col};font-size:9px">${d >= 0 ? "▲" : "▼"}${str}</span>`;
+    };
+
+    const header = `
 <div style="padding:7px 10px;background:#1e293b;display:flex;align-items:center;justify-content:space-between;gap:8px">
   <div>
     <div style="font-size:11px;font-weight:700;color:#fff">📍 Nagpur</div>
@@ -928,150 +1968,122 @@ const HoverTooltip = React.memo(({ currentWeekBands, width, height, bbox, weekIn
   </div>
 </div>`;
 
-      const footer = `<div style="padding:3px 10px 5px;border-top:1px solid #f1f5f9"><span style="font-size:8px;color:#d1d5db">▲▼ vs ${year} annual avg · px(${x},${y})</span></div>`;
+    const footer = `<div style="padding:3px 10px 5px;border-top:1px solid #f1f5f9"><span style="font-size:8px;color:#9ca3af">▲▼ vs ${year} annual avg · ${isTiffLive() ? "COG TIFF pixel" : "TIFF loading…"}</span></div>`;
 
-      // Helper: format annual diff arrow
-      const diff = (val: number, annual: number | undefined, fmt: (v: number) => string): string => {
-        if (annual == null) return "";
-        const d = val - annual;
-        const col = d > 0 ? "#ef4444" : "#22c55e";
-        const abs = Math.abs(d);
-        const str = abs < 0.001 ? "0.0" : abs < 1 ? abs.toFixed(3) : abs.toFixed(1);
-        return ` <span style="color:${col};font-size:9px">${d >= 0 ? "▲" : "▼"}${str}</span>`;
-      };
+    if (activeLayer === "lst") {
+      const lst   = getTooltipValue("lst",   weekIndex, lat, lng);
+      const ndvi  = getTooltipValue("ndvi",  weekIndex, lat, lng);
+      const rain  = getTooltipValue("rain",  weekIndex, lat, lng);
+      const soil  = getTooltipValue("soil",  weekIndex, lat, lng);
+      const water = getTooltipValue("water", weekIndex, lat, lng);
+      const lulcRaw   = getTooltipValue("lulc", weekIndex, lat, lng);
+      const lulcIdx   = lulcRaw !== null ? Math.round(Math.max(0, Math.min(8, lulcRaw))) : null;
+      const lulcLabel = lulcIdx !== null ? (LULC_CLASSES[lulcIdx]?.label ?? "—") : "No Data";
 
-      if (!popupRef.current) {
-        popupRef.current = L.popup({ closeButton: false, offset: [0, -4], maxWidth: 260, className: "nagpur-tooltip", autoPan: false });
-      }
+      const fmtOrND = (v: number | null, fmt: (n: number) => string) => v !== null ? fmt(v) : "No Data";
 
-      // ── LST layer: show ALL bands in two-column layout ─────────────────────
-      if (activeLayer === "lst") {
-        const lst   = readPx("lst");
-        const ndvi  = readPx("ndvi");
-        const rain  = readPx("rain");
-        const soil  = readPx("soil");
-        const water = readPx("water");
-        const lulc  = readPx("lulc");
-        const am    = annualMeans;
+      const leftCol = [
+        `<div style="margin-bottom:6px">
+          <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🌡 Temp ${srcBadge("lst")}</div>
+          <div style="font-size:17px;font-weight:900;color:#ea580c;font-family:monospace;line-height:1.15">${fmtOrND(lst, v => `${v.toFixed(1)}°C${delta(v, am.lst)}`)}</div>
+         </div>`,
+        `<div style="margin-bottom:6px">
+          <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🌧 Rain ${srcBadge("rain")}</div>
+          <div style="font-size:13px;font-weight:700;color:#0284c7;font-family:monospace">${fmtOrND(rain, v => `${v.toFixed(1)} mm${delta(v, am.rain)}`)}</div>
+         </div>`,
+        `<div>
+          <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🗺 LULC ${srcBadge("lulc")}</div>
+          <div style="font-size:11px;font-weight:700;color:#7c3aed;font-family:monospace">${lulcLabel}</div>
+         </div>`,
+      ].join("");
 
-        const lulcCls   = lulc !== null ? Math.round(lulc) : null;
-        const lulcLabel = lulcCls !== null && lulcCls >= 0 && lulcCls <= 8 ? LULC_CLASSES[lulcCls].label : "—";
+      const rightCol = [
+        `<div style="margin-bottom:6px">
+          <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🌿 NDVI ${srcBadge("ndvi")}</div>
+          <div style="font-size:13px;font-weight:700;color:#16a34a;font-family:monospace">${fmtOrND(ndvi, v => `${v.toFixed(3)}${delta(v, am.ndvi)}`)}</div>
+         </div>`,
+        `<div style="margin-bottom:6px">
+          <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🌱 Soil ${srcBadge("soil")}</div>
+          <div style="font-size:13px;font-weight:700;color:#65a30d;font-family:monospace">${fmtOrND(soil, v => `${(v*100).toFixed(1)}%${delta(v, am.soil)}`)}</div>
+         </div>`,
+        `<div>
+          <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">💧 Water ${srcBadge("water")}</div>
+          <div style="font-size:13px;font-weight:700;color:#0891b2;font-family:monospace">${fmtOrND(water, v => `${v.toFixed(1)}%${delta(v, am.water)}`)}</div>
+         </div>`,
+      ].join("");
 
-        // Left column: LST (hero) + Rain + LULC
-        const leftCol = [
-          lst !== null
-            ? `<div style="margin-bottom:6px">
-                <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🌡 Temp</div>
-                <div style="font-size:17px;font-weight:900;color:#ea580c;font-family:monospace;line-height:1.15">${lst.toFixed(1)}°C${diff(lst, am?.lst, v => v.toFixed(1)+"°C")}</div>
-               </div>`
-            : `<div style="margin-bottom:6px"><div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase">🌡 Temp</div><div style="font-size:13px;color:#d1d5db;font-family:monospace">—</div></div>`,
-          rain !== null
-            ? `<div style="margin-bottom:6px">
-                <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🌧 Rain</div>
-                <div style="font-size:13px;font-weight:700;color:#0284c7;font-family:monospace">${rain.toFixed(1)} mm${diff(rain, am?.rain, v => v.toFixed(1))}</div>
-               </div>`
-            : "",
-          lulc !== null
-            ? `<div>
-                <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🗺 LULC</div>
-                <div style="font-size:11px;font-weight:700;color:#7c3aed;font-family:monospace">${lulcLabel}</div>
-               </div>`
-            : "",
-        ].join("");
-
-        // Right column: NDVI + Soil + Water
-        const rightCol = [
-          ndvi !== null
-            ? `<div style="margin-bottom:6px">
-                <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🌿 NDVI</div>
-                <div style="font-size:13px;font-weight:700;color:#16a34a;font-family:monospace">${ndvi.toFixed(3)}${diff(ndvi, am?.ndvi, v => v.toFixed(3))}</div>
-               </div>`
-            : "",
-          soil !== null
-            ? `<div style="margin-bottom:6px">
-                <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">🌱 Soil</div>
-                <div style="font-size:13px;font-weight:700;color:#65a30d;font-family:monospace">${(soil*100).toFixed(1)}%${diff(soil, am?.soil, v => (v*100).toFixed(1)+"%")}</div>
-               </div>`
-            : "",
-          water !== null
-            ? `<div>
-                <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">💧 Water</div>
-                <div style="font-size:13px;font-weight:700;color:#0891b2;font-family:monospace">${water.toFixed(1)}%${diff(water, am?.water, v => v.toFixed(1)+"%")}</div>
-               </div>`
-            : "",
-        ].join("");
-
-        popupRef.current.setLatLng([lat, lng]).setContent(`
+      popupRef.current.setLatLng([lat, lng]).setContent(`
 ${TOOLTIP_STYLE}
 <div style="font-family:system-ui,-apple-system,sans-serif;width:240px;background:#fff">
   ${header}
   <div style="display:flex;padding:8px 10px 6px;gap:0;align-items:flex-start">
-    <div style="flex:1;min-width:0;padding-right:8px">${leftCol || "<span style='font-size:11px;color:#d1d5db'>—</span>"}</div>
+    <div style="flex:1;min-width:0;padding-right:8px">${leftCol}</div>
     <div style="width:1px;background:#f1f5f9;flex-shrink:0;align-self:stretch"></div>
-    <div style="flex:1;min-width:0;padding-left:8px">${rightCol || "<span style='font-size:11px;color:#d1d5db'>—</span>"}</div>
+    <div style="flex:1;min-width:0;padding-left:8px">${rightCol}</div>
   </div>
   ${footer}
 </div>`).openOn(map);
-        return;
-      }
+      return;
+    }
 
-      // ── All other layers: single-value lightweight tooltip ─────────────────
-      const val = readPx(activeLayer);
-      const am  = annualMeans;
+    const raw = getTooltipValue(activeLayer, weekIndex, lat, lng);
 
-      let valDisplay = "—";
-      let annualDisplay = "—";
-      let accentColor = "#374151";
+    let valDisplay    = "No Data";
+    let annualDisplay = "—";
+    let accentColor   = "#374151";
 
+    if (raw !== null) {
       if (activeLayer === "ndvi") {
-        accentColor = "#16a34a";
-        valDisplay    = val !== null ? `${val.toFixed(3)}${diff(val, am?.ndvi, v => v.toFixed(3))}` : "—";
-        annualDisplay = am ? am.ndvi.toFixed(3) : "—";
+        accentColor   = "#16a34a";
+        valDisplay    = `${raw.toFixed(3)}${delta(raw, am.ndvi)}`;
+        annualDisplay = am.ndvi.toFixed(3);
       } else if (activeLayer === "rain") {
-        accentColor = "#0284c7";
-        valDisplay    = val !== null ? `${val.toFixed(1)} mm${diff(val, am?.rain, v => v.toFixed(1))}` : "—";
-        annualDisplay = am ? `${am.rain.toFixed(1)} mm` : "—";
+        accentColor   = "#0284c7";
+        valDisplay    = `${raw.toFixed(1)} mm${delta(raw, am.rain)}`;
+        annualDisplay = `${am.rain.toFixed(1)} mm`;
       } else if (activeLayer === "soil") {
-        accentColor = "#65a30d";
-        valDisplay    = val !== null ? `${(val*100).toFixed(1)}%${diff(val, am?.soil, v => (v*100).toFixed(1)+"%")}` : "—";
-        annualDisplay = am ? `${(am.soil*100).toFixed(1)}%` : "—";
+        accentColor   = "#65a30d";
+        valDisplay    = `${(raw*100).toFixed(1)}%${delta(raw, am.soil)}`;
+        annualDisplay = `${(am.soil*100).toFixed(1)}%`;
       } else if (activeLayer === "water") {
-        accentColor = "#0891b2";
-        valDisplay    = val !== null ? `${val.toFixed(1)}%${diff(val, am?.water, v => v.toFixed(1)+"%")}` : "—";
-        annualDisplay = am ? `${am.water.toFixed(1)}%` : "—";
+        accentColor   = "#0891b2";
+        valDisplay    = `${raw.toFixed(1)}%${delta(raw, am.water)}`;
+        annualDisplay = `${am.water.toFixed(1)}%`;
       } else if (activeLayer === "lulc") {
-        accentColor = "#7c3aed";
-        const cls   = val !== null ? Math.round(val) : null;
-        valDisplay  = cls !== null && cls >= 0 && cls <= 8 ? LULC_CLASSES[cls].label : "—";
-        annualDisplay = "—"; // no annual mean for LULC
+        accentColor   = "#7c3aed";
+        const cls     = Math.round(Math.max(0, Math.min(8, raw)));
+        valDisplay    = LULC_CLASSES[cls]?.label ?? "—";
+        annualDisplay = "—";
       }
+    } else {
+      if (activeLayer === "ndvi")  accentColor = "#16a34a";
+      else if (activeLayer === "rain")  accentColor = "#0284c7";
+      else if (activeLayer === "soil")  accentColor = "#65a30d";
+      else if (activeLayer === "water") accentColor = "#0891b2";
+      else if (activeLayer === "lulc")  accentColor = "#7c3aed";
+    }
 
-      const meta = LAYER_META[activeLayer];
-
-      popupRef.current.setLatLng([lat, lng]).setContent(`
+    const meta = LAYER_META[activeLayer];
+    popupRef.current.setLatLng([lat, lng]).setContent(`
 ${TOOLTIP_STYLE}
 <div style="font-family:system-ui,-apple-system,sans-serif;width:190px;background:#fff">
   ${header}
   <div style="padding:9px 12px 7px">
-    <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">${meta.emoji} ${meta.name}</div>
+    <div style="font-size:9px;color:#9ca3af;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">${meta.emoji} ${meta.name} ${srcBadge(activeLayer)}</div>
     <div style="font-size:20px;font-weight:900;color:${accentColor};font-family:monospace;line-height:1.2">${valDisplay}</div>
     ${activeLayer !== "lulc" ? `<div style="margin-top:5px;font-size:9px;color:#9ca3af">avg ${year}: <span style="color:#374151;font-weight:600">${annualDisplay}</span></div>` : ""}
   </div>
   ${footer}
 </div>`).openOn(map);
-    },
-    mouseout() {
-      try { if (popupRef.current) map.closePopup(popupRef.current); } catch (_) {}
-      lastPxRef.current = null;
-    },
-  });
+  }
 
   return null;
 });
 
-// ─── Layer Switcher ───────────────────────────────────────────────────────────
+// ─── Layer Switcher helpers ───────────────────────────────────────────────────
 
 const LAYER_ORDER: LayerType[] = ["lst","ndvi","rain","soil","water","lulc"];
+
 const LAYER_ACTIVE_COLORS: Record<LayerType, { bg: string; border: string; text: string }> = {
   lst:   { bg: "#fff7ed", border: "#fed7aa", text: "#ea580c" },
   ndvi:  { bg: "#f0fdf4", border: "#bbf7d0", text: "#16a34a" },
@@ -1087,7 +2099,7 @@ function WeekNavigator({ weekIndex, year, setWeekIndex, setYear }: {
   weekIndex: number; year: number;
   setWeekIndex: (w: number) => void; setYear: (y: number) => void;
 }) {
-  const [open, setOpen]               = React.useState(false);
+  const [open,        setOpen]        = React.useState(false);
   const dropRef                       = React.useRef<HTMLDivElement>(null);
   const [pickerYear,  setPickerYear]  = React.useState(year);
   const [pickerMonth, setPickerMonth] = React.useState(0);
@@ -1096,8 +2108,7 @@ function WeekNavigator({ weekIndex, year, setWeekIndex, setYear }: {
   React.useEffect(() => {
     setPickerYear(year);
     setPickerWeek(weekIndex);
-    const d = dateFromWeek(year, weekIndex);
-    setPickerMonth(d.getMonth());
+    setPickerMonth(dateFromWeek(year, weekIndex).getMonth());
   }, [weekIndex, year]);
 
   React.useEffect(() => {
@@ -1132,13 +2143,15 @@ function WeekNavigator({ weekIndex, year, setWeekIndex, setYear }: {
     <div ref={dropRef} style={{ position: "absolute", bottom: 20, left: "50%", transform: "translateX(-50%)", zIndex: 700 }}>
       <style>{`.ndate::-webkit-scrollbar{width:4px}.ndate::-webkit-scrollbar-thumb{background:#f97316;border-radius:4px}`}</style>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <button onClick={() => { if (weekIndex > 0) setWeekIndex(weekIndex - 1); else if (year > 2015) { setYear(year - 1); setWeekIndex(N_WEEKS - 1); } }}
+        <button
+          onClick={() => { if (weekIndex > 0) setWeekIndex(weekIndex - 1); else if (year > AVAILABLE_YEARS[0]) { setYear(year - 1); setWeekIndex(N_WEEKS - 1); } }}
           style={{ background:"#fff",border:"1px solid #e5e7eb",borderRadius:12,width:36,height:36,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 2px 8px rgba(0,0,0,0.08)",flexShrink:0 }}
           onMouseEnter={e=>(e.currentTarget.style.background="#f8fafc")} onMouseLeave={e=>(e.currentTarget.style.background="#fff")}>
           <svg width={14} height={14} viewBox="0 0 14 14" fill="none"><path d="M9 2L4 7l5 5" stroke="#374151" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"/></svg>
         </button>
 
-        <button onClick={() => setOpen(o => !o)} style={{ background:"#fff",border:"1px solid #e5e7eb",borderRadius:18,boxShadow:"0 4px 20px rgba(0,0,0,0.12)",padding:"10px 20px",display:"flex",alignItems:"center",gap:14,cursor:"pointer",userSelect:"none",minWidth:300 }}>
+        <button onClick={() => setOpen(o => !o)}
+          style={{ background:"#fff",border:"1px solid #e5e7eb",borderRadius:18,boxShadow:"0 4px 20px rgba(0,0,0,0.12)",padding:"10px 20px",display:"flex",alignItems:"center",gap:14,cursor:"pointer",userSelect:"none",minWidth:300 }}>
           <div style={{ display:"flex",flexDirection:"column",alignItems:"center",minWidth:46,flexShrink:0 }}>
             <span style={{ fontSize:22,fontWeight:900,color:"#111827",fontFamily:"monospace",lineHeight:1,letterSpacing:"-1px" }}>{year}</span>
             <span style={{ fontSize:9,color:"#f97316",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.12em",marginTop:2 }}>YEAR</span>
@@ -1156,7 +2169,8 @@ function WeekNavigator({ weekIndex, year, setWeekIndex, setYear }: {
           </svg>
         </button>
 
-        <button onClick={() => { if (weekIndex < N_WEEKS - 1) setWeekIndex(weekIndex + 1); else if (year < 2025) { setYear(year + 1); setWeekIndex(0); } }}
+        <button
+          onClick={() => { if (weekIndex < N_WEEKS - 1) setWeekIndex(weekIndex + 1); else if (year < AVAILABLE_YEARS[AVAILABLE_YEARS.length - 1]) { setYear(year + 1); setWeekIndex(0); } }}
           style={{ background:"#fff",border:"1px solid #e5e7eb",borderRadius:12,width:36,height:36,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 2px 8px rgba(0,0,0,0.08)",flexShrink:0 }}
           onMouseEnter={e=>(e.currentTarget.style.background="#f8fafc")} onMouseLeave={e=>(e.currentTarget.style.background="#fff")}>
           <svg width={14} height={14} viewBox="0 0 14 14" fill="none"><path d="M5 2l5 5-5 5" stroke="#374151" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -1168,15 +2182,21 @@ function WeekNavigator({ weekIndex, year, setWeekIndex, setYear }: {
           <div style={{ marginBottom:14 }}>
             <div style={{ fontSize:10,color:"#9ca3af",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8 }}>Select Year</div>
             <div style={{ display:"flex",flexWrap:"wrap",gap:6 }}>
-              {YEARS.map(y => <button key={y} onClick={() => setPickerYear(y)}
-                style={{ padding:"5px 12px",borderRadius:8,border:`1.5px solid ${pickerYear===y?"#f97316":"#e5e7eb"}`,background:pickerYear===y?"#fff7ed":"#f8fafc",color:pickerYear===y?"#f97316":"#374151",fontSize:12,fontWeight:700,cursor:"pointer" }}>{y}</button>)}
+              {YEARS.map(y => (
+                <button key={`year-${y}`} onClick={() => setPickerYear(y)}
+                  style={{ padding:"5px 12px",borderRadius:8,border:`1.5px solid ${pickerYear===y?"#f97316":"#e5e7eb"}`,background:pickerYear===y?"#fff7ed":"#f8fafc",color:pickerYear===y?"#f97316":"#374151",fontSize:12,fontWeight:700,cursor:"pointer",position:"relative" }}>
+                  {y}
+                </button>
+              ))}
             </div>
           </div>
           <div style={{ marginBottom:14 }}>
             <div style={{ fontSize:10,color:"#9ca3af",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8 }}>Select Month</div>
             <div style={{ display:"flex",flexWrap:"wrap",gap:5 }}>
-              {MONTH_NAMES.map((mn,mi) => <button key={mn} onClick={() => { setPickerMonth(mi); setPickerWeek(weeksInMonth.find(w => w.wi >= 0)?.wi ?? 0); }}
-                style={{ padding:"5px 10px",borderRadius:8,border:`1.5px solid ${pickerMonth===mi?"#f97316":"#e5e7eb"}`,background:pickerMonth===mi?"#fff7ed":"#f8fafc",color:pickerMonth===mi?"#f97316":"#374151",fontSize:11,fontWeight:700,cursor:"pointer" }}>{mn}</button>)}
+              {MONTH_NAMES.map((mn,mi) => (
+                <button key={mn} onClick={() => { setPickerMonth(mi); setPickerWeek(weeksInMonth.find(w => w.wi >= 0)?.wi ?? 0); }}
+                  style={{ padding:"5px 10px",borderRadius:8,border:`1.5px solid ${pickerMonth===mi?"#f97316":"#e5e7eb"}`,background:pickerMonth===mi?"#fff7ed":"#f8fafc",color:pickerMonth===mi?"#f97316":"#374151",fontSize:11,fontWeight:700,cursor:"pointer" }}>{mn}</button>
+              ))}
             </div>
           </div>
           <div style={{ marginBottom:14 }}>
@@ -1207,11 +2227,13 @@ function YearTimeline({ year, setYear, weekIndex, setWeekIndex }: {
     <div style={{ position:"absolute",top:16,left:"50%",transform:"translateX(-50%)",zIndex:600,pointerEvents:"auto" }}>
       <div style={{ background:"rgba(255,255,255,0.97)",border:"1px solid #e5e7eb",borderRadius:999,padding:"6px 10px",boxShadow:"0 2px 12px rgba(0,0,0,0.08)",display:"flex",alignItems:"center",gap:4 }}>
         {YEARS.map(y => (
-          <button key={y} onClick={() => { setYear(y); setWeekIndex(Math.min(weekIndex, N_WEEKS - 1)); }}
-            style={{ padding:"4px 10px",borderRadius:999,border:"none",background:y===year?"#f97316":"transparent",color:y===year?"#fff":"#6b7280",fontSize:11,fontWeight:700,cursor:"pointer",transition:"all 0.15s" }}
+          <button key={`year-${y}`}
+            onClick={() => { setYear(y); setWeekIndex(Math.min(weekIndex, N_WEEKS - 1)); }}
+            style={{ padding:"4px 10px",borderRadius:999,border:"none",background:y===year?"#f97316":"transparent",color:y===year?"#fff":"#6b7280",fontSize:11,fontWeight:700,cursor:"pointer",transition:"all 0.15s",position:"relative" }}
             onMouseEnter={e => { if (y!==year) (e.currentTarget as HTMLButtonElement).style.background="#f8fafc"; }}
-            onMouseLeave={e => { if (y!==year) (e.currentTarget as HTMLButtonElement).style.background="transparent"; }}
-          >{y}</button>
+            onMouseLeave={e => { if (y!==year) (e.currentTarget as HTMLButtonElement).style.background="transparent"; }}>
+            {y}
+          </button>
         ))}
       </div>
     </div>
@@ -1264,347 +2286,142 @@ function LayerLegend({ activeLayer }: { activeLayer: LayerType }) {
 
 // ─── Map Instance ─────────────────────────────────────────────────────────────
 
-function MapInstance({ setMap }: { setMap: (map: any) => void }) {
+function MapInstance({ setMap }: { setMap: (map: L.Map) => void }) {
   const map = useMap();
   useEffect(() => { setMap(map); }, [map, setMap]);
   return null;
 }
 
-// ─── On-Demand Weekly GeoTIFF Loader ─────────────────────────────────────────
+// ─── Tiles Not Available Banner ───────────────────────────────────────────────
 
-function OnDemandGeoTiffLayer({ year, weekIndex, activeLayer, onMetadata, onWeekBandsLoaded, onStatsUpdated, onAnnualMeansUpdated, onMockMode }: {
-  year: number; weekIndex: number; activeLayer: LayerType;
-  onMetadata: (width: number, height: number, bbox: number[]) => void;
-  onWeekBandsLoaded: (bands: any[]) => void;
-  onStatsUpdated: (stats: RealStats) => void;
-  onAnnualMeansUpdated: (means: AnnualMeans) => void;
-  onMockMode?: (isMock: boolean) => void;
-}) {
-  const tiffCache           = useRef<Record<number, any>>({});
-  const [meta, setMeta]     = useState<{ width: number; height: number; bbox: number[] } | null>(null);
-  const [useMock, setUseMock] = useState(false);
-  const annualMeansComputed = useRef<Set<number>>(new Set());
-
-  const NAGPUR_BBOX = [78.65, 20.70, 79.70, 21.58];
-  const MOCK_W = 220, MOCK_H = 180;
-
-  const loadTiff = useCallback(async (yr: number): Promise<any | null> => {
-    if (tiffCache.current[yr]) return tiffCache.current[yr];
-    const url = `/Nagpur_Weekly_${yr}.tif`;
-    try {
-      const res = await fetch(url);
-      if (!res.ok) return null;
-      const buf  = await res.arrayBuffer();
-      const tiff = await GeoTIFF.fromArrayBuffer(buf);
-      const img  = await tiff.getImage();
-      tiffCache.current[yr] = img;
-      return img;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    setUseMock(false);
-    setMeta(null);
-    annualMeansComputed.current.delete(year);
-
-    const init = async () => {
-      const img = await loadTiff(year);
-      if (cancelled) return;
-      if (!img) {
-        setMeta({ width: MOCK_W, height: MOCK_H, bbox: NAGPUR_BBOX });
-        setUseMock(true);
-        onMockMode?.(true);
-        onMetadata(MOCK_W, MOCK_H, NAGPUR_BBOX);
-        return;
-      }
-      const width  = img.getWidth();
-      const height = img.getHeight();
-      const bbox   = img.getBoundingBox();
-      setMeta({ width, height, bbox });
-      onMockMode?.(false);
-      onMetadata(width, height, bbox);
-    };
-    init();
-    return () => { cancelled = true; };
-  }, [year]);
-
-  const readBand = async (img: any, bandIdx: number, W: number, H: number): Promise<Float32Array | null> => {
-    const STRIP_H = 64;
-    const out = new Float32Array(W * H);
-    try {
-      for (let row = 0; row < H; row += STRIP_H) {
-        const rowEnd = Math.min(row + STRIP_H, H);
-        const strip  = await img.readRasters({
-          window: [0, row, W, rowEnd],
-          samples: [bandIdx],
-          interleave: false,
-        });
-        if (!strip || !strip[0]) return null;
-        out.set(strip[0] as Float32Array, row * W);
-      }
-      let valid = 0;
-      for (let i = 0; i < out.length; i++) {
-        if (Number.isFinite(out[i]) && out[i] > NODATA + 1) valid++;
-      }
-      if (valid === 0) return null;
-      return out;
-    } catch {
-      return null;
-    }
-  };
-
-  const generateMockBands = (W: number, H: number, wi: number): any[] => {
-    const size   = W * H;
-    const season = Math.sin((wi / N_WEEKS) * 2 * Math.PI);
-    const bands: Float32Array[] = Array.from({ length: BANDS_PER_WEEK }, () => new Float32Array(size));
-    for (let i = 0; i < size; i++) {
-      const row = Math.floor(i / W), col = i % W;
-      const sp  = Math.sin(row / 10) * Math.cos(col / 10) * 0.3;
-      bands[0][i] = Math.max(-0.1, Math.min(0.85, 0.35 + season * 0.25 + sp * 0.2));
-      const p1 = Math.cos((wi/52 - 0.37) * 2 * Math.PI) * 11;
-      const monsoonDip = (wi >= 22 && wi <= 37) ? -6 : 0;
-      bands[1][i] = Math.max(12, Math.min(55, 38 + p1 + monsoonDip + sp * 3 + (Math.random()-0.5)*2));
-      bands[2][i] = Math.max(0, (season > 0.3 ? season * 30 : 0) + (Math.random()-0.5)*5);
-      bands[3][i] = Math.max(0, Math.min(1, 0.3 + season * 0.3));
-      bands[4][i] = Math.max(0, Math.min(100, 5 + Math.max(0, season) * 20));
-      bands[5][i] = [4, 4, 6, 1, 4, 4, 6, 1, 4][Math.floor(Math.random() * 9)];
-    }
-    return bands as any[];
-  };
-
-  const processBand = (band: Float32Array, layer: LayerType): RealStats | null => {
-    const raw: number[] = [];
-    for (let i = 0; i < band.length; i++) {
-      const v = band[i];
-      if (!Number.isFinite(v) || isNaN(v) || v <= NODATA + 1) continue;
-      raw.push(v);
-    }
-    if (!raw.length) return null;
-    const sorted = [...raw].sort((a, b) => a - b);
-    const p2  = sorted[Math.floor(sorted.length * 0.02)];
-    const p98 = sorted[Math.floor(sorted.length * 0.98)];
-    const vals = raw.filter(v => v >= p2 && v <= p98);
-    if (!vals.length) return null;
-    const avg  = vals.reduce((a,b) => a+b,0) / vals.length;
-    const minV = Math.min(...vals);
-    const maxV = Math.max(...vals);
-    const hot  = layer === "lst" ? vals.filter(v => v > avg + 5).length : 0;
-    const cool = layer === "lst" ? vals.filter(v => v < avg - 5).length : 0;
-    const mod  = vals.length - hot - cool;
-    return {
-      avg, min: minV, max: maxV,
-      hotPct:  hot  / vals.length * 100,
-      modPct:  mod  / vals.length * 100,
-      coolPct: cool / vals.length * 100,
-      count: vals.length,
-    };
-  };
-
-  useEffect(() => {
-    if (!meta) return;
-    let cancelled = false;
-
-    const load = async () => {
-      const { width: W, height: H } = meta;
-
-      if (useMock) {
-        await new Promise(r => setTimeout(r, 80));
-        if (!cancelled) {
-          const bands = generateMockBands(W, H, weekIndex);
-          onWeekBandsLoaded(bands);
-          const stats = processBand(bands[BAND_OFFSET[activeLayer]], activeLayer);
-          if (stats) onStatsUpdated(stats);
-        }
-        return;
-      }
-
-      const img = tiffCache.current[year];
-      if (!img) return;
-
-      const activeBandIdx = getBandIdx(weekIndex, activeLayer);
-      const activeBand = await readBand(img, activeBandIdx, W, H);
-      if (cancelled) return;
-
-      if (activeBand) {
-        const placeholder = new Array(BANDS_PER_WEEK).fill(null);
-        placeholder[BAND_OFFSET[activeLayer]] = activeBand;
-        onWeekBandsLoaded(placeholder);
-        const stats = processBand(activeBand, activeLayer);
-        if (stats && !cancelled) onStatsUpdated(stats);
-      }
-
-      const full = new Array(BANDS_PER_WEEK).fill(null);
-      if (activeBand) full[BAND_OFFSET[activeLayer]] = activeBand;
-
-      for (let offset = 0; offset < BANDS_PER_WEEK; offset++) {
-        if (offset === BAND_OFFSET[activeLayer] || cancelled) continue;
-        const entry = Object.entries(BAND_OFFSET).find(([, v]) => v === offset);
-        if (!entry) continue;
-        const bi   = getBandIdx(weekIndex, entry[0] as LayerType);
-        const band = await readBand(img, bi, W, H);
-        if (band && !cancelled) { full[offset] = band; onWeekBandsLoaded([...full]); }
-      }
-    };
-
-    load();
-    return () => { cancelled = true; };
-  }, [meta, useMock, year, weekIndex, activeLayer]);
-
-  // ── Annual means: sample 12 weeks (one per month) ─────────────────────────
-  useEffect(() => {
-    if (!meta || useMock || annualMeansComputed.current.has(year)) return;
-    annualMeansComputed.current.add(year);
-    let cancelled = false;
-
-    const SAMPLE_WEEKS = [1, 5, 9, 14, 18, 22, 27, 31, 35, 40, 44, 49];
-
-    const bandMean = (band: Float32Array | null, mn: number, mx: number): number | null => {
-      if (!band) return null;
-      let s = 0, c = 0;
-      for (let i = 0; i < band.length; i++) {
-        const v = band[i];
-        if (Number.isFinite(v) && !isNaN(v) && v > NODATA + 1 && v >= mn && v <= mx) { s += v; c++; }
-      }
-      return c > 0 ? s / c : null;
-    };
-
-    const run = async () => {
-      const img = await loadTiff(year);
-      if (!img || cancelled) return;
-      const W = meta.width, H = meta.height;
-      let sumN=0, sumL=0, sumR=0, sumS=0, sumW=0, valid=0;
-
-      for (const wi of SAMPLE_WEEKS) {
-        if (cancelled) return;
-        const bN = await readBand(img, getBandIdx(wi, "ndvi"),  W, H); if (cancelled) return;
-        const bL = await readBand(img, getBandIdx(wi, "lst"),   W, H); if (cancelled) return;
-        const bR = await readBand(img, getBandIdx(wi, "rain"),  W, H); if (cancelled) return;
-        const bS = await readBand(img, getBandIdx(wi, "soil"),  W, H); if (cancelled) return;
-        const bW = await readBand(img, getBandIdx(wi, "water"), W, H); if (cancelled) return;
-
-        const mN = bandMean(bN, -1,    1);
-        const mL = bandMean(bL, -9998, 99999);
-        const mR = bandMean(bR, 0,     500);
-        const mS = bandMean(bS, 0,     1);
-        const mW = bandMean(bW, 0,     100);
-        if (mN !== null && mL !== null && mR !== null && mS !== null && mW !== null) {
-          sumN+=mN; sumL+=mL; sumR+=mR; sumS+=mS; sumW+=mW; valid++;
-        }
-        await new Promise(r => setTimeout(r, 0));
-      }
-      if (!cancelled && valid > 0) {
-        onAnnualMeansUpdated({ ndvi: sumN/valid, lst: sumL/valid, rain: sumR/valid, soil: sumS/valid, water: sumW/valid });
-      }
-    };
-    run();
-    return () => { cancelled = true; };
-  }, [meta, useMock, year]);
-
-  return null;
+function TilesUnavailableBanner({ year }: { year: number }) {
+  return (
+    <div style={{ position:"absolute",top:56,left:"50%",transform:"translateX(-50%)",zIndex:650,pointerEvents:"none" }}>
+      <div style={{ background:"rgba(251,191,36,0.97)",border:"1px solid #f59e0b",borderRadius:999,padding:"4px 14px",boxShadow:"0 2px 8px rgba(0,0,0,0.10)",display:"flex",alignItems:"center",gap:6 }}>
+        <span style={{ fontSize:12 }}>⚠️</span>
+        <span style={{ fontSize:11,fontWeight:700,color:"#92400e" }}>Tiles not yet available for {year}</span>
+      </div>
+    </div>
+  );
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export default function Nagpur() {
-  const [year,        setYearRaw]    = useState<number>(2025);
+  const [year,        setYearRaw]    = useState<number>(DEFAULT_YEAR);
   const [weekIndex,   setWeekRaw]    = useState<number>(0);
-  const [loading,     setLoading]    = useState(true);
   const [mapType,     setMapType]    = useState<MapType>("osm");
   const [activeLayer, setActiveLayer]= useState<LayerType>("lst");
   const [infoOpen,    setInfoOpen]   = useState(false);
   const [layerOpen,   setLayerOpen]  = useState(false);
 
-  const [tiffWidth,  setTiffWidth]   = useState(0);
-  const [tiffHeight, setTiffHeight]  = useState(0);
-  const [tiffBbox,   setTiffBbox]    = useState<number[]>([]);
-  const [isMockMode, setIsMockMode]  = useState(false);
-
-  const [currentWeekBands, setCurrentWeekBands] = useState<any[] | null>(null);
-  const [currentBand,      setCurrentBand]       = useState<any>(null);
-  const [bandMin,          setBandMin]            = useState(0);
-  const [bandMax,          setBandMax]            = useState(0);
-  const [realStats,        setRealStats]          = useState<RealStats | null>(null);
-  const [annualMeans,      setAnnualMeans]        = useState<AnnualMeans | null>(null);
+  const [tiffReady, setTiffReady]       = useState<boolean>(false);
+  const [realStats,  setRealStats]      = useState<RealStats>(() => getWeekStats(activeLayer, weekIndex));
+  const [annualMeans, setAnnualMeans]   = useState<AnnualMeans>(() => computeAnnualMeans());
 
   const setYear = useCallback((y: number) => {
     setYearRaw(y);
-    setLoading(true);
-    setRealStats(null);
-    setAnnualMeans(null);
-    setCurrentWeekBands(null);
-    setCurrentBand(null);
-  }, []);
-
-  const setWeekIndex = useCallback((w: number) => {
-    setWeekRaw(w);
-    setLoading(true);
-    setRealStats(null);
-    setCurrentWeekBands(null);
-    setCurrentBand(null);
+    const existing = TIFF_CACHE_MAP.get(y);
+    if (existing) {
+      TIFF_CACHE   = existing;
+      _ACTIVE_YEAR = y;
+      clearHeatmapCache();
+      setTiffReady(true);
+    } else {
+      TIFF_CACHE = null;
+      setTiffReady(false);
+      loadMainTiff(y).then(cache => {
+        if (cache) {
+          clearHeatmapCache();
+          detectAndLogScales(cache.bands, cache.nodata);
+          setTiffReady(true);
+        }
+      });
+    }
   }, []);
 
   useEffect(() => {
-    if (!currentWeekBands) { setCurrentBand(null); return; }
-    const band = currentWeekBands[BAND_OFFSET[activeLayer]];
-    if (!band) { setCurrentBand(null); return; }
-    const hint = LAYER_RANGE[activeLayer];
-    const [lo, hi] = computeRange(band, hint.min, hint.max);
-    setBandMin(lo);
-    setBandMax(hi);
-    setCurrentBand(band);
-    setLoading(false);
-  }, [currentWeekBands, activeLayer]);
+    prewarmTiffs(year);
+    let cancelled = false;
+    const poll = () => {
+      if (cancelled) return;
+      if (TIFF_CACHE_MAP.has(year) || TIFF_CACHE) {
+        const c = TIFF_CACHE_MAP.get(year);
+        if (c) { TIFF_CACHE = c; _ACTIVE_YEAR = year; }
+        setTiffReady(true);
+        setRealStats(getWeekStats(activeLayer, weekIndex));
+        setAnnualMeans(computeAnnualMeans());
+      } else {
+        setTimeout(poll, 300);
+      }
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleMetadata    = useCallback((w: number, h: number, bbox: number[]) => { setTiffWidth(w); setTiffHeight(h); setTiffBbox(bbox); }, []);
-  const handleBandsLoaded = useCallback((bands: any[]) => { setCurrentWeekBands(bands); }, []);
-  const handleStats       = useCallback((stats: RealStats) => { setRealStats(stats); }, []);
-  const handleAnnualMeans = useCallback((means: AnnualMeans) => { setAnnualMeans(means); }, []);
+  useEffect(() => {
+    setRealStats(getWeekStats(activeLayer, weekIndex));
+  }, [activeLayer, weekIndex, tiffReady]);
+
+  useEffect(() => {
+    setAnnualMeans(computeAnnualMeans());
+  }, [year, tiffReady]);
+
+  const tilesAvailable = TILES_AVAILABLE_YEARS.has(year);
+  const tileYear       = year;
+
+  const setWeekIndex = useCallback((w: number) => { setWeekRaw(w); }, []);
 
   const meta = LAYER_META[activeLayer];
   const info = LAYER_INFO[activeLayer];
   const d1   = dateFromWeek(year, weekIndex);
   const d2   = dateEndFromWeek(year, weekIndex);
 
+  const setMap = useCallback((_map: L.Map) => {}, []);
+
   return (
     <div style={{ display:"flex", height:"100vh", width:"100%", fontFamily:"'Inter',system-ui,sans-serif", overflow:"hidden", background:"#f1f5f9" }}>
       {infoOpen && <InfoTab activeLayer={activeLayer} onClose={() => setInfoOpen(false)} />}
-      <div style={{ flex:1, position:"relative", cursor:"crosshair" }}>
-        {loading && (
-          <div style={{ position:"absolute", inset:0, zIndex:1000, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"rgba(248,250,252,0.84)", backdropFilter:"blur(6px)" }}>
-            <div style={{ animation:"spin 1s linear infinite", display:"flex", marginBottom:10 }}><Layers size={32} color="#0ea5e9" /></div>
-            <style>{`@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
-            <p style={{ color:"#475569", fontSize:13, fontWeight:500 }}>Loading {meta.name} · Week {weekIndex + 1} · {year}…</p>
-          </div>
-        )}
 
-        <MapContainer bounds={[[20.70, 78.65], [21.58, 79.70]]} zoom={10} style={{ width:"100%", height:"100vh" }} zoomControl={false} maxZoom={18} minZoom={7}>
-          <MapInstance setMap={() => {}} />
+      <div style={{ flex:1, position:"relative", cursor:"crosshair" }}>
+        <MapContainer
+          bounds={[[20.70, 78.65], [21.58, 79.70]]}
+          zoom={10}
+          style={{ width:"100%", height:"100vh" }}
+          zoomControl={false}
+          maxZoom={18}
+          minZoom={7}
+        >
+          <MapInstance setMap={setMap} />
           <BasemapTiles mapType={mapType} />
-          <OnDemandGeoTiffLayer
-            year={year}
-            weekIndex={weekIndex}
-            activeLayer={activeLayer}
-            onMetadata={handleMetadata}
-            onWeekBandsLoaded={handleBandsLoaded}
-            onStatsUpdated={handleStats}
-            onAnnualMeansUpdated={handleAnnualMeans}
-            onMockMode={setIsMockMode}
-          />
-          {currentBand && tiffWidth > 0 && tiffHeight > 0 && tiffBbox.length === 4 && (
-            <CanvasLayer band={currentBand} width={tiffWidth} height={tiffHeight} bbox={tiffBbox} minVal={bandMin} maxVal={bandMax} layerType={activeLayer} />
-          )}
+          <RasterTileLayer year={tileYear} />
+          {tiffReady && <CanvasHeatmapLayer activeLayer={activeLayer} weekIndex={weekIndex} year={year} />}
           <NagpurBoundaryLayer />
-          <HoverTooltip currentWeekBands={currentWeekBands} width={tiffWidth} height={tiffHeight} bbox={tiffBbox} weekIndex={weekIndex} year={year} annualMeans={annualMeans} activeLayer={activeLayer} />
+          <HoverTooltip
+            weekIndex={weekIndex}
+            year={year}
+            annualMeans={annualMeans}
+            activeLayer={activeLayer}
+          />
           <MapControls mapType={mapType} setMapType={setMapType} />
         </MapContainer>
 
-        {/* Layer Switcher */}
+        <div style={{ position:"absolute", top:60, left:"50%", transform:"translateX(-50%)", zIndex:600, pointerEvents:"none" }}>
+          <div style={{ background:"rgba(255,255,255,0.95)", border:"1px solid #e5e7eb", borderRadius:999, padding:"5px 14px", boxShadow:"0 2px 12px rgba(0,0,0,0.08)", display:"flex", alignItems:"center", gap:6 }}>
+            <span style={{ width:7, height:7, borderRadius:"50%", background:meta.dotColor, display:"inline-block" }} />
+            <span style={{ fontSize:11.5, fontWeight:600, color:"#374151" }}>{meta.emoji} {meta.name}</span>
+            <span style={{ fontSize:10, color:"#9ca3af" }}>· {meta.desc}</span>
+            <span style={{ fontSize:10, color:"#9ca3af" }}>· Week {weekIndex + 1} · {formatDateShort(d1)}–{formatDateShort(d2)}</span>
+            {activeLayer === "lst" && realStats.tiffDerived && (
+              <span style={{ fontSize:10, color:"#f97316", fontWeight:600 }}>· {realStats.avg.toFixed(1)}°C avg</span>
+            )}
+          </div>
+        </div>
+
         <div style={{ position:"absolute", top:16, left:infoOpen?356:16, zIndex:700, transition:"left 0.22s cubic-bezier(0.22,1,0.36,1)" }}>
           <div style={{ background:"rgba(255,255,255,0.97)", border:"1px solid #e5e7eb", borderRadius:14, boxShadow:"0 4px 20px rgba(0,0,0,0.10)", padding:"6px 8px", display:"flex", flexDirection:"column", gap:0, minWidth:110 }}>
-            <button onClick={() => setLayerOpen(o => !o)} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:6, padding:"5px 4px 6px", background:"transparent", border:"none", cursor:"pointer", width:"100%", borderRadius:8 }}
+            <button onClick={() => setLayerOpen(o => !o)}
+              style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:6, padding:"5px 4px 6px", background:"transparent", border:"none", cursor:"pointer", width:"100%", borderRadius:8 }}
               onMouseEnter={e=>(e.currentTarget.style.background="#f8fafc")} onMouseLeave={e=>(e.currentTarget.style.background="transparent")}>
               <div style={{ display:"flex", alignItems:"center", gap:6 }}>
                 <span style={{ fontSize:15, lineHeight:1 }}>{LAYER_META[activeLayer].emoji}</span>
@@ -1633,7 +2450,6 @@ export default function Nagpur() {
           </div>
         </div>
 
-        {/* Info button */}
         <div style={{ position:"absolute", bottom:220, left:infoOpen?356:16, zIndex:700, transition:"left 0.22s cubic-bezier(0.22,1,0.36,1)" }}>
           <button onClick={() => setInfoOpen(o => !o)} title="Layer Information"
             style={{ width:38, height:38, background:infoOpen?info.accentColor:"#fff", border:`1.5px solid ${infoOpen?info.accentColor:"#e5e7eb"}`, borderRadius:10, boxShadow:"0 4px 16px rgba(0,0,0,0.10)", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.18s" }}>
@@ -1641,42 +2457,27 @@ export default function Nagpur() {
           </button>
         </div>
 
-        {/* Mock mode warning */}
-        {isMockMode && !loading && (
-          <div style={{ position:"absolute", top:56, left:"50%", transform:"translateX(-50%)", zIndex:650, pointerEvents:"none" }}>
-            <div style={{ background:"rgba(251,191,36,0.97)", border:"1px solid #f59e0b", borderRadius:999, padding:"4px 14px", boxShadow:"0 2px 8px rgba(0,0,0,0.10)", display:"flex", alignItems:"center", gap:6 }}>
-              <span style={{ fontSize:12 }}>⚠️</span>
-              <span style={{ fontSize:11, fontWeight:700, color:"#92400e" }}>Demo/simulated data — place <code style={{fontFamily:"monospace",fontSize:10}}>/Nagpur_Weekly_{year}.tif</code> in public folder</span>
-            </div>
-          </div>
-        )}
-
-        {/* Status pill */}
-        <div style={{ position:"absolute", top:60, left:"50%", transform:"translateX(-50%)", zIndex:600, pointerEvents:"none" }}>
-          <div style={{ background:"rgba(255,255,255,0.95)", border:"1px solid #e5e7eb", borderRadius:999, padding:"5px 14px", boxShadow:"0 2px 12px rgba(0,0,0,0.08)", display:"flex", alignItems:"center", gap:6 }}>
-            <span style={{ width:7, height:7, borderRadius:"50%", background:meta.dotColor, display:"inline-block" }} />
-            <span style={{ fontSize:11.5, fontWeight:600, color:"#374151" }}>{meta.emoji} {meta.name}</span>
-            <span style={{ fontSize:10, color:"#9ca3af" }}>· {meta.desc}</span>
-            <span style={{ fontSize:10, color:"#9ca3af" }}>· Week {weekIndex + 1} · {formatDateShort(d1)}–{formatDateShort(d2)}</span>
-            {realStats && activeLayer === "lst" && (
-              <span style={{ fontSize:10, color:"#f97316", fontWeight:600 }}>· {realStats.avg.toFixed(1)}°C avg</span>
-            )}
-          </div>
-        </div>
-
         <YearTimeline year={year} setYear={setYear} weekIndex={weekIndex} setWeekIndex={setWeekIndex} />
         <LayerLegend activeLayer={activeLayer} />
         <WeekNavigator weekIndex={weekIndex} year={year} setWeekIndex={setWeekIndex} setYear={setYear} />
       </div>
 
-      {/* Analytics sidebar */}
       <aside style={{ width:272, flexShrink:0, display:"flex", flexDirection:"column", background:"#f8fafc", borderLeft:"1px solid #e5e7eb", overflowY:"auto", zIndex:10 }}>
         <div style={{ padding:"18px 16px 12px", borderBottom:"1px solid #e5e7eb", background:"#fff" }}>
           <p style={{ fontSize:13, fontWeight:700, color:"#111827" }}>Analytics</p>
-          <p style={{ fontSize:11, color:"#9ca3af", marginTop:2 }}>Nagpur District · {year}{realStats && <span style={{ color:"#22c55e", fontWeight:700 }}> · {isMockMode ? "⚠️ Simulated" : "Live ✓"}</span>}</p>
+          <p style={{ fontSize:11, color:"#9ca3af", marginTop:2 }}>
+            Nagpur District · {year}
+            <span style={{ color:"#22c55e", fontWeight:700 }}> · Tiles ✓</span>
+          </p>
         </div>
         <div style={{ padding:"12px 12px 20px" }}>
-          <AnalyticsContent stats={realStats} activeLayer={activeLayer} weekIndex={weekIndex} year={year} annualMeans={annualMeans} />
+          <AnalyticsContent
+            stats={realStats}
+            activeLayer={activeLayer}
+            weekIndex={weekIndex}
+            year={year}
+            annualMeans={annualMeans}
+          />
         </div>
       </aside>
     </div>
