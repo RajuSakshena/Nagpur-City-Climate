@@ -1166,7 +1166,7 @@ function renderHeatmapToDataUrl(layer: LayerType, weekIndex: number): string | n
   return dataUrl;
 }
 
-const CanvasHeatmapLayer = React.memo(({ activeLayer, weekIndex, year: _year }: {
+const CanvasHeatmapLayer = React.memo(({ activeLayer, weekIndex }: {
   activeLayer: LayerType; weekIndex: number; year: number;
 }) => {
   const map        = useMap();
