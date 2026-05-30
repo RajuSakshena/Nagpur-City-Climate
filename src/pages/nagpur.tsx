@@ -1289,7 +1289,6 @@ function SummaryGrid({ items }: {
 
 function AnnualMeansPanel({ means, year }: { means: AnnualMeans; year: number }) {
   const loaded = means.lst > 0 || means.ndvi > 0;
-  const _fmt = (v: number, decimals: number) => loaded ? v.toFixed(decimals) : "—";
   const rows = [
     { label: "🌿 NDVI",         value: loaded ? means.ndvi.toFixed(3) : "—",                           note: "avg greenness", color: "#16a34a", bg: "#f0fdf4" },
     { label: "🌡️ Temperature",  value: loaded ? `${means.lst.toFixed(1)} °C` : "—",                     note: "avg LST",       color: "#ea580c", bg: "#fff7ed" },
@@ -1593,12 +1592,6 @@ function AnalyticsContent({ stats, activeLayer, weekIndex, year, annualMeans }: 
   stats: RealStats; activeLayer: LayerType; weekIndex: number; year: number; annualMeans: AnnualMeans;
 }) {
   const isLoading = !stats.tiffDerived;
-
-  const _donutData = useMemo(() => [
-    { name: "Hot",      value: Math.round(stats.hotPct  * 10) / 10, color: "#ef4444" },
-    { name: "Moderate", value: Math.round(stats.modPct  * 10) / 10, color: "#facc15" },
-    { name: "Cool",     value: Math.round(stats.coolPct * 10) / 10, color: "#3b82f6" },
-  ], [stats]);
 
   const meta        = LAYER_META[activeLayer];
   const accentColor = LAYER_INFO[activeLayer].accentColor;
@@ -2292,19 +2285,6 @@ function MapInstance({ setMap }: { setMap: (map: L.Map) => void }) {
   return null;
 }
 
-// ─── Tiles Not Available Banner ───────────────────────────────────────────────
-
-function _TilesUnavailableBanner({ year }: { year: number }) {
-  return (
-    <div style={{ position:"absolute",top:56,left:"50%",transform:"translateX(-50%)",zIndex:650,pointerEvents:"none" }}>
-      <div style={{ background:"rgba(251,191,36,0.97)",border:"1px solid #f59e0b",borderRadius:999,padding:"4px 14px",boxShadow:"0 2px 8px rgba(0,0,0,0.10)",display:"flex",alignItems:"center",gap:6 }}>
-        <span style={{ fontSize:12 }}>⚠️</span>
-        <span style={{ fontSize:11,fontWeight:700,color:"#92400e" }}>Tiles not yet available for {year}</span>
-      </div>
-    </div>
-  );
-}
-
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export default function Nagpur() {
@@ -2367,7 +2347,6 @@ export default function Nagpur() {
     setAnnualMeans(computeAnnualMeans());
   }, [year, tiffReady]);
 
-  const _tilesAvailable = TILES_AVAILABLE_YEARS.has(year);
   const tileYear       = year;
 
   const setWeekIndex = useCallback((w: number) => { setWeekRaw(w); }, []);
