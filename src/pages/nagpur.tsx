@@ -39,7 +39,7 @@ function getTileUrl(year: number): string | null {
 }
 
 function getCogUrl(year: number): string {
-  return `/cog/Nagpur_Weekly_${year}_cog.tif`;
+  return `https://huggingface.co/datasets/Jackmyble/nagpur-climate-cog/resolve/main/Nagpur_Weekly_${year}_cog.tif`;
 }
 
 // ─── COG TIFF Sampler — WITH FULL DEBUGGING ──────────────────────────────────
