@@ -1851,6 +1851,11 @@ const GLOBAL_CSS = `
   mix-blend-mode: normal;
   image-rendering: pixelated;
 }
+@media (max-width: 768px) {
+  .nagpur-layer-select {
+    max-width: 100px !important;
+  }
+}
 `;
 if (typeof document !== "undefined") {
   const styleId = "nagpur-global-css";
@@ -2243,6 +2248,9 @@ function TimelineControlsInline({
       display: "flex",
       alignItems: "center",
       gap: "7px",
+      overflow: "hidden",
+      boxSizing: "border-box",
+      minWidth: 0,
     }}>
 
       {/* Play / Pause */}
@@ -2284,14 +2292,18 @@ function TimelineControlsInline({
       </span>
 
       {/* Layer Dropdown */}
+      <div style={{ position: "relative", flexShrink: 1, minWidth: 0, maxWidth: 160 }}>
       <select
         value={activeLayer}
         onChange={e => setActiveLayer(e.target.value as LayerType)}
         style={{
-          flexShrink: 0, fontSize: 11, fontWeight: 600,
+          flexShrink: 1, minWidth: 0, maxWidth: 160, width: "100%",
+          fontSize: 11, fontWeight: 600,
           background: "#f8fafc", border: "1px solid #e5e7eb",
           borderRadius: 6, color: "#374151",
           padding: "3px 5px", cursor: "pointer",
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          boxSizing: "border-box",
         }}
       >
         {LAYER_ORDER.map(layer => (
@@ -2300,6 +2312,7 @@ function TimelineControlsInline({
           </option>
         ))}
       </select>
+      </div>
 
     </div>
   );
@@ -2539,7 +2552,7 @@ export default function Nagpur() {
         </div>
 
         {/* Left panel: layer dropdown + timeline controls stacked together */}
-        <div style={{ position:"absolute", top:16, left:infoOpen?356:16, zIndex:700, transition:"left 0.22s cubic-bezier(0.22,1,0.36,1)", display:"flex", flexDirection:"column", gap:6, width:300 }}>
+        <div style={{ position:"absolute", top:16, left:infoOpen?356:16, zIndex:700, transition:"left 0.22s cubic-bezier(0.22,1,0.36,1)", display:"flex", flexDirection:"column", gap:6, width:340, maxWidth:340, boxSizing:"border-box", overflow:"visible" }}>
 
           {/* Layer dropdown card */}
           <div style={{ background:"rgba(255,255,255,0.97)", border:"1px solid #e5e7eb", borderRadius:14, boxShadow:"0 4px 20px rgba(0,0,0,0.10)", padding:"6px 8px", display:"flex", flexDirection:"column", gap:0, width:"100%", overflow:"hidden", boxSizing:"border-box" }}>
