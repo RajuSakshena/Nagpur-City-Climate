@@ -2211,6 +2211,100 @@ function WeekNavigator({ weekIndex, year, setWeekIndex, setYear }: {
   );
 }
 
+// ─── Timeline Controls (Play/Pause + Year Slider + Layer Dropdown) ────────────
+
+function TimelineControlsInline({
+  year,
+  setYear,
+  isPlaying,
+  setIsPlaying,
+  activeLayer,
+  setActiveLayer,
+  isDataLoaded,
+}: {
+  year: number;
+  setYear: (y: number) => void;
+  isPlaying: boolean;
+  setIsPlaying: (v: boolean) => void;
+  activeLayer: LayerType;
+  setActiveLayer: (l: LayerType) => void;
+  isDataLoaded: boolean;
+}) {
+  return (
+    <div style={{
+      width: "100%",
+      background: "rgba(255,255,255,0.95)",
+      backdropFilter: "blur(6px)",
+      WebkitBackdropFilter: "blur(6px)",
+      padding: "6px 10px",
+      borderRadius: "10px",
+      border: "1px solid rgba(0,0,0,0.10)",
+      boxShadow: "0 2px 12px rgba(0,0,0,0.10)",
+      display: "flex",
+      alignItems: "center",
+      gap: "7px",
+    }}>
+
+      {/* Play / Pause */}
+      <button
+        onClick={() => { if (isDataLoaded) setIsPlaying(!isPlaying); }}
+        disabled={!isDataLoaded}
+        title={!isDataLoaded ? "Loading data…" : isPlaying ? "Pause" : "Play"}
+        style={{
+          width: 28, height: 28, borderRadius: "50%",
+          background: !isDataLoaded ? "#e5e7eb" : isPlaying ? "#0ea5e9" : "#e0f2fe",
+          color: !isDataLoaded ? "#9ca3af" : isPlaying ? "#fff" : "#0ea5e9",
+          fontSize: 11, cursor: isDataLoaded ? "pointer" : "not-allowed",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          flexShrink: 0, transition: "all 0.18s",
+          border: `1.5px solid ${!isDataLoaded ? "#e5e7eb" : "#0ea5e9"}`,
+        }}
+      >
+        {!isDataLoaded ? "⏳" : isPlaying ? "⏸" : "▶"}
+      </button>
+
+      {/* Slider */}
+      <input
+        type="range"
+        min={AVAILABLE_YEARS[0]}
+        max={AVAILABLE_YEARS[AVAILABLE_YEARS.length - 1]}
+        step={1}
+        value={year}
+        onChange={e => setYear(Number(e.target.value))}
+        style={{ flex: 1, accentColor: "#0ea5e9", cursor: "pointer" }}
+      />
+
+      {/* Year badge */}
+      <span style={{
+        flexShrink: 0, fontSize: 12, fontWeight: 700,
+        color: "#0ea5e9", fontFamily: "monospace",
+        minWidth: 36, textAlign: "center",
+      }}>
+        {year}
+      </span>
+
+      {/* Layer Dropdown */}
+      <select
+        value={activeLayer}
+        onChange={e => setActiveLayer(e.target.value as LayerType)}
+        style={{
+          flexShrink: 0, fontSize: 11, fontWeight: 600,
+          background: "#f8fafc", border: "1px solid #e5e7eb",
+          borderRadius: 6, color: "#374151",
+          padding: "3px 5px", cursor: "pointer",
+        }}
+      >
+        {LAYER_ORDER.map(layer => (
+          <option key={layer} value={layer}>
+            {LAYER_META[layer].emoji} {LAYER_META[layer].label}
+          </option>
+        ))}
+      </select>
+
+    </div>
+  );
+}
+
 // ─── Year Timeline ────────────────────────────────────────────────────────────
 
 function YearTimeline({ year, setYear, weekIndex, setWeekIndex }: {
@@ -2240,7 +2334,7 @@ function LayerLegend({ activeLayer }: { activeLayer: LayerType }) {
   const legend = LAYER_LEGEND[activeLayer];
   if (activeLayer === "lulc") {
     return (
-      <div style={{ position:"absolute",bottom:100,left:16,zIndex:500 }}>
+      <div style={{ position:"absolute",bottom:110,left:16,zIndex:500 }}>
         <Card style={{ padding:"10px 14px",minWidth:180 }}>
           <div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:6 }}>
             <Activity size={13} color="#0ea5e9" />
@@ -2260,7 +2354,7 @@ function LayerLegend({ activeLayer }: { activeLayer: LayerType }) {
     );
   }
   return (
-    <div style={{ position:"absolute",bottom:100,left:16,zIndex:500 }}>
+    <div style={{ position:"absolute",bottom:110,left:16,zIndex:500 }}>
       <Card style={{ padding:"10px 14px",minWidth:190 }}>
         <div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:6 }}>
           <Activity size={13} color="#0ea5e9" />
@@ -2295,7 +2389,9 @@ export default function Nagpur() {
   const [infoOpen,    setInfoOpen]   = useState(false);
   const [layerOpen,   setLayerOpen]  = useState(false);
 
-  const [tiffReady, setTiffReady]       = useState<boolean>(false);
+  const [isPlaying,     setIsPlaying]     = useState<boolean>(false);
+  const [isDataLoaded,  setIsDataLoaded]  = useState<boolean>(false);
+  const [tiffReady, setTiffReady]         = useState<boolean>(false);
   const [realStats,  setRealStats]      = useState<RealStats>(() => getWeekStats(activeLayer, weekIndex));
   const [annualMeans, setAnnualMeans]   = useState<AnnualMeans>(() => computeAnnualMeans());
 
@@ -2307,21 +2403,65 @@ export default function Nagpur() {
       _ACTIVE_YEAR = y;
       clearHeatmapCache();
       setTiffReady(true);
+      setIsDataLoaded(true);
     } else {
       TIFF_CACHE = null;
       setTiffReady(false);
+      setIsDataLoaded(false);
       loadMainTiff(y).then(cache => {
         if (cache) {
           clearHeatmapCache();
           detectAndLogScales(cache.bands, cache.nodata);
           setTiffReady(true);
+          setIsDataLoaded(true);
         }
       });
     }
   }, []);
 
+  // ── Play/Pause auto-advance (only when data is loaded) ──────────────────────
+  const yearRef = useRef(year);
+  yearRef.current = year;
   useEffect(() => {
-    prewarmTiffs(year);
+    if (!isPlaying || !isDataLoaded) return;
+    const interval = setInterval(() => {
+      if (yearRef.current >= AVAILABLE_YEARS[AVAILABLE_YEARS.length - 1]) {
+        // End of cycle — stop and wait for manual play press
+        setIsPlaying(false);
+      } else {
+        setYear(yearRef.current + 1);
+      }
+    }, 1500);
+    return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, isDataLoaded]);
+
+  // ── Background preload: after current year loads, silently load other years ──
+  useEffect(() => {
+    if (!isDataLoaded) return;
+    // Preload adjacent years in background — descending from current, then ascending
+    const allOthers = AVAILABLE_YEARS.filter(y => y !== year);
+    const ordered = [
+      ...allOthers.filter(y => y < year).sort((a, b) => b - a),
+      ...allOthers.filter(y => y > year).sort((a, b) => a - b),
+    ];
+    let cancelled = false;
+    const preload = async () => {
+      for (const y of ordered) {
+        if (cancelled) break;
+        if (!TIFF_CACHE_MAP.has(y)) {
+          await loadMainTiff(y);
+          // Small pause between fetches to not saturate bandwidth
+          await new Promise(r => setTimeout(r, 500));
+        }
+      }
+    };
+    preload();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDataLoaded, year]);
+
+  useEffect(() => {
     let cancelled = false;
     const poll = () => {
       if (cancelled) return;
@@ -2329,6 +2469,7 @@ export default function Nagpur() {
         const c = TIFF_CACHE_MAP.get(year);
         if (c) { TIFF_CACHE = c; _ACTIVE_YEAR = year; }
         setTiffReady(true);
+        setIsDataLoaded(true);
         setRealStats(getWeekStats(activeLayer, weekIndex));
         setAnnualMeans(computeAnnualMeans());
       } else {
@@ -2397,39 +2538,54 @@ export default function Nagpur() {
           </div>
         </div>
 
-        <div style={{ position:"absolute", top:16, left:infoOpen?356:16, zIndex:700, transition:"left 0.22s cubic-bezier(0.22,1,0.36,1)" }}>
-          <div style={{ background:"rgba(255,255,255,0.97)", border:"1px solid #e5e7eb", borderRadius:14, boxShadow:"0 4px 20px rgba(0,0,0,0.10)", padding:"6px 8px", display:"flex", flexDirection:"column", gap:0, minWidth:110 }}>
+        {/* Left panel: layer dropdown + timeline controls stacked together */}
+        <div style={{ position:"absolute", top:16, left:infoOpen?356:16, zIndex:700, transition:"left 0.22s cubic-bezier(0.22,1,0.36,1)", display:"flex", flexDirection:"column", gap:6, width:300 }}>
+
+          {/* Layer dropdown card */}
+          <div style={{ background:"rgba(255,255,255,0.97)", border:"1px solid #e5e7eb", borderRadius:14, boxShadow:"0 4px 20px rgba(0,0,0,0.10)", padding:"6px 8px", display:"flex", flexDirection:"column", gap:0, width:"100%", overflow:"hidden", boxSizing:"border-box" }}>
             <button onClick={() => setLayerOpen(o => !o)}
-              style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:6, padding:"5px 4px 6px", background:"transparent", border:"none", cursor:"pointer", width:"100%", borderRadius:8 }}
+              style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:6, padding:"5px 4px 6px", background:"transparent", border:"none", cursor:"pointer", width:"100%", borderRadius:8, boxSizing:"border-box" }}
               onMouseEnter={e=>(e.currentTarget.style.background="#f8fafc")} onMouseLeave={e=>(e.currentTarget.style.background="transparent")}>
-              <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                <span style={{ fontSize:15, lineHeight:1 }}>{LAYER_META[activeLayer].emoji}</span>
-                <span style={{ fontSize:11, fontWeight:700, color:LAYER_ACTIVE_COLORS[activeLayer].text, whiteSpace:"nowrap" }}>{LAYER_META[activeLayer].label}</span>
+              <div style={{ display:"flex", alignItems:"center", gap:6, overflow:"hidden" }}>
+                <span style={{ fontSize:15, lineHeight:1, flexShrink:0 }}>{LAYER_META[activeLayer].emoji}</span>
+                <span style={{ fontSize:11, fontWeight:700, color:LAYER_ACTIVE_COLORS[activeLayer].text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{LAYER_META[activeLayer].label}</span>
               </div>
               <svg width={12} height={12} viewBox="0 0 12 12" fill="none" style={{ transition:"transform 0.2s", transform:layerOpen?"rotate(180deg)":"rotate(0deg)", flexShrink:0 }}>
                 <path d="M2 4l4 4 4-4" stroke="#9ca3af" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"/>
               </svg>
             </button>
             {layerOpen && (
-              <div style={{ display:"flex", flexDirection:"column", gap:2, marginTop:2, borderTop:"1px solid #f1f5f9", paddingTop:6 }}>
+              <div style={{ display:"flex", flexDirection:"column", gap:2, marginTop:2, borderTop:"1px solid #f1f5f9", paddingTop:6, width:"100%", boxSizing:"border-box" }}>
                 {LAYER_ORDER.filter(l => l !== activeLayer).map(layer => {
                   const lm = LAYER_META[layer]; const ac = LAYER_ACTIVE_COLORS[layer];
                   return (
                     <button key={layer} onClick={() => { setActiveLayer(layer); setLayerOpen(false); }} title={lm.name}
-                      style={{ display:"flex", alignItems:"center", gap:6, padding:"6px 8px", borderRadius:9, border:"1px solid transparent", background:"transparent", cursor:"pointer", transition:"all 0.15s", width:"100%" }}
+                      style={{ display:"flex", alignItems:"center", gap:6, padding:"6px 8px", borderRadius:9, border:"1px solid transparent", background:"transparent", cursor:"pointer", transition:"all 0.15s", width:"100%", boxSizing:"border-box", overflow:"hidden" }}
                       onMouseEnter={e=>{(e.currentTarget as HTMLButtonElement).style.background=ac.bg; (e.currentTarget as HTMLButtonElement).style.border=`1px solid ${ac.border}`;}}
                       onMouseLeave={e=>{(e.currentTarget as HTMLButtonElement).style.background="transparent"; (e.currentTarget as HTMLButtonElement).style.border="1px solid transparent";}}>
                       <span style={{ fontSize:15, lineHeight:1, flexShrink:0 }}>{lm.emoji}</span>
-                      <span style={{ fontSize:10.5, fontWeight:500, color:"#6b7280", whiteSpace:"nowrap" }}>{lm.label}</span>
+                      <span style={{ fontSize:10.5, fontWeight:500, color:"#6b7280", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{lm.label}</span>
                     </button>
                   );
                 })}
               </div>
             )}
           </div>
+
+          {/* Timeline controls — always below dropdown, never overlaps */}
+          <TimelineControlsInline
+            year={year}
+            setYear={setYear}
+            isPlaying={isPlaying}
+            setIsPlaying={setIsPlaying}
+            activeLayer={activeLayer}
+            setActiveLayer={setActiveLayer}
+            isDataLoaded={isDataLoaded}
+          />
+
         </div>
 
-        <div style={{ position:"absolute", bottom:220, left:infoOpen?356:16, zIndex:700, transition:"left 0.22s cubic-bezier(0.22,1,0.36,1)" }}>
+        <div style={{ position:"absolute", bottom:320, left:infoOpen?356:16, zIndex:700, transition:"left 0.22s cubic-bezier(0.22,1,0.36,1)" }}>
           <button onClick={() => setInfoOpen(o => !o)} title="Layer Information"
             style={{ width:38, height:38, background:infoOpen?info.accentColor:"#fff", border:`1.5px solid ${infoOpen?info.accentColor:"#e5e7eb"}`, borderRadius:10, boxShadow:"0 4px 16px rgba(0,0,0,0.10)", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.18s" }}>
             <Info size={16} color={infoOpen?"#fff":info.accentColor} />
